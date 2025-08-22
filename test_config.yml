@@ -1,0 +1,65 @@
+# test_config.yml - Simplified configuration for smoke test
+
+# Environment Configuration (Minimal 2-satellite setup)
+environment:
+  n_satellites: 2          # Simplest possible network
+  altitude_km: 550         # Standard LEO altitude
+  inclination_deg: 0.0     # Equatorial orbit for simplicity
+  frequency_ghz: 300       # THz band
+  bandwidth_ghz: 10        # 10 GHz bandwidth
+  tx_power_dbm: 30         # 1W transmit power
+  noise_figure_db: 3.0     # Typical receiver NF
+  max_isl_range_km: 5000   # Maximum ISL range
+
+# ISAC Task Configuration (Balanced weights)
+isac:
+  w_comm: 1.0              # Communication weight
+  w_sens: 0.5              # Sensing weight (reduced for initial test)
+  w_penalty: 5.0           # Moderate penalty for violations
+  sensing_mode: "cooperative_orbit_determination"
+  min_links_for_sensing: 1  # Only 1 link in 2-sat network
+
+# Agent Configuration (Aggressive learning for quick convergence)
+agent:
+  actor_lr: 0.0005         # Higher learning rate for faster convergence
+  critic_lr: 0.001         # Higher critic LR
+  reward_lr: 0.0005        # Reward decomposition LR
+  tau: 0.01                # Faster soft update
+  gamma: 0.95              # Slightly lower discount for faster learning
+  buffer_capacity: 50000   # Smaller buffer for quick testing
+  batch_size: 64           # Smaller batch for more frequent updates
+  use_prioritized_replay: true
+  use_difference_rewards: false  # Disable for simplicity
+  use_gru: false           # IMPORTANT: Use MLP baseline for stability
+
+# Network Architecture (Simplified)
+network:
+  hidden_dims: [128, 64]   # Smaller network for faster training
+  gat_hidden: 32           # Reduced GAT dimensions
+  gat_heads: 2             # Fewer attention heads
+  gru_hidden: 64           # Not used when use_gru=false
+  dropout: 0.1             # Standard dropout
+
+# Training Configuration (Short run)
+training:
+  max_episodes: 200        # Quick test run
+  max_steps_per_episode: 50  # Shorter episodes
+  warmup_episodes: 20      # Brief exploration phase
+  update_frequency: 1      # Update every step
+  noise_decay_rate: 0.99   # Faster noise decay
+  min_noise: 0.01          # Minimum exploration noise
+  gradient_clip_norm: 0.5  # Gradient clipping for stability
+
+# Evaluation Configuration
+evaluation:
+  frequency: 20            # Evaluate every 20 episodes
+  episodes: 5              # Quick evaluation
+  benchmark_sca: false     # Skip SCA for speed
+  compare_baselines: true  # Compare with simple baselines
+
+# Logging Configuration
+logging:
+  use_tensorboard: true
+  save_frequency: 50       # Save models every 50 episodes
+  verbose: true            # Print progress
+  log_dir: "./test_run"    # Test run directory
