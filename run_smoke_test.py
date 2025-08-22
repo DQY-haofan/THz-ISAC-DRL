@@ -16,24 +16,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import json
 
-def check_dependencies():
-    """Check if all required packages are installed."""
-    required_packages = [
-        'torch', 'numpy', 'matplotlib', 'pandas', 'pyyaml', 'scipy'
-    ]
-    
-    missing = []
-    for package in required_packages:
-        try:
-            __import__(package)
-        except ImportError:
-            missing.append(package)
-    
-    if missing:
-        print(f"Missing packages: {missing}")
-        print("Please install with: pip install " + " ".join(missing))
-        return False
-    return True
+
 
 def run_training():
     """Execute the training script with test configuration."""
