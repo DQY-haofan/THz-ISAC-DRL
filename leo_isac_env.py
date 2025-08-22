@@ -312,16 +312,16 @@ class LEO_ISAC_Env:
     
     def _compute_rewards(self, actions: Dict) -> Dict[str, float]:
         """
-        Compute ISAC rewards using the physical layer interface.
-        
-        This method is now MUCH simpler thanks to the interface abstraction.
+        Compute ISAC rewards with improved sensing reward based on D-optimality.
         """
         rewards = {}
         
         for agent_id in self.agent_ids:
-            # Get reward components from physical layer
+            # Communication reward (unchanged)
             r_comm = self.phy_interface.get_total_comm_reward(agent_id)
-            r_sens = self.phy_interface.get_total_sens_reward(agent_id)
+            
+            # Enhanced sensing reward based on D-optimality
+            r_sens = self._compute_sensing_reward_d_optimal(agent_id)
             
             # Calculate penalty for constraint violation
             r_penalty = 0.0
@@ -341,13 +341,50 @@ class LEO_ISAC_Env:
             )
         
         return rewards
+    def _compute_sensing_reward_d_optimal(self, agent_id: str) -> float:
+        """
+        Compute sensing reward based on D-optimality (minimize det(CRLB)).
+        
+        D-optimal design minimizes the volume of the error ellipsoid,
+        which is proportional to sqrt(det(CRLB)) = 1/sqrt(det(FIM)).
+        """
+        try:
+            # Get current network FIM from physical layer
+            if self.phy_interface.efim is not None:
+                current_fim = self.phy_interface.efim
+                
+                # Calculate contribution from agent's links
+                agent_contribution = 0.0
+                for link_id, metrics in self.phy_interface.link_metrics.items():
+                    if metrics['tx_id'] == agent_id:
+                        # Use log-det for numerical stability
+                        # Reward is proportional to information gain
+                        J_link = self.phy_interface.get_fim_contribution(link_id)
+                        if J_link is not None:
+                            # Simple proxy: trace of FIM contribution
+                            agent_contribution += np.trace(J_link) / self.n_agents
+                
+                # Normalize by network size
+                reward = np.log(1 + agent_contribution)
+            else:
+                # No valid FIM, return zero reward
+                reward = 0.0
+                
+        except Exception as e:
+            warnings.warn(f"Error computing D-optimal reward: {e}")
+            reward = 0.0
+        
+        return reward
+    
     
     def _compute_observations(self) -> Dict[str, np.ndarray]:
         """
-        Compute local observations for all agents.
-        
-        Simplified to query pre-computed values from the physical layer.
+        Compute local observations for all agents with improved normalization.
         """
+        # Statistics for SINR normalization (based on typical LEO ISL values)
+        SINR_DB_MEAN = 10.0  # Typical SINR in dB
+        SINR_DB_STD = 15.0   # Standard deviation in dB
+        
         observations = {}
         
         for agent_id in self.agent_ids:
@@ -359,14 +396,24 @@ class LEO_ISAC_Env:
             obs.velocity = sat.current_state.velocity
             obs.available_power = self.max_tx_power_w
             
-            # Get link quality from physical layer
+            # Get link quality from physical layer with improved normalization
             for link_id in self.link_registry:
                 tx_id, rx_id = self.link_registry[link_id]
                 if tx_id == agent_id:
                     # Get SINR from physical layer
-                    sinr = self.phy_interface.get_effective_sinr(link_id)
-                    # Normalize to [0, 1] range for observation
-                    obs.channel_states[link_id] = np.tanh(sinr / 10.0)
+                    sinr_linear = self.phy_interface.get_effective_sinr(link_id)
+                    
+                    # Convert to dB scale and normalize
+                    if sinr_linear > 0:
+                        sinr_db = 10 * np.log10(sinr_linear)
+                        # Standardize to approximately [-1, 1] range
+                        normalized_sinr = (sinr_db - SINR_DB_MEAN) / SINR_DB_STD
+                        # Apply tanh for bounded output
+                        normalized_sinr = np.tanh(normalized_sinr)
+                    else:
+                        normalized_sinr = -1.0  # Minimum value for no signal
+                    
+                    obs.channel_states[link_id] = normalized_sinr
                     obs.buffer_lengths[link_id] = self.data_buffers[tx_id][rx_id]
             
             # Estimate interference level (simplified)

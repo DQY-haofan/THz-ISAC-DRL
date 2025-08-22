@@ -171,7 +171,109 @@ class GraphAttentionLayer(nn.Module):
         
         return output
 
-
+class ActorNetworkMLP(nn.Module):
+    """
+    Simplified Actor Network without RNN for baseline comparison.
+    Uses only GAT and MLP, suitable for experience replay without sequence issues.
+    """
+    
+    def __init__(self, obs_dim: int, action_dim: int,
+                 num_neighbors: int = 4, neighbor_dim: int = 10,
+                 hidden_dims: List[int] = [256, 128],
+                 gat_hidden: int = 64, gat_heads: int = 4,
+                 total_power_budget: float = 1.0,
+                 per_link_max: float = 0.5,
+                 dropout: float = 0.1):
+        """
+        Initialize MLP-based actor network.
+        
+        Args:
+            obs_dim: Dimension of agent's observation
+            action_dim: Dimension of action space
+            num_neighbors: Maximum number of neighbors
+            neighbor_dim: Dimension of neighbor features
+            hidden_dims: Hidden layer dimensions for MLP
+            gat_hidden: GAT hidden dimension
+            gat_heads: Number of GAT attention heads
+            total_power_budget: Total power constraint
+            per_link_max: Per-link power constraint
+            dropout: Dropout probability
+        """
+        super(ActorNetworkMLP, self).__init__()
+        
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
+        
+        # GAT for neighbor information processing
+        self.gat = GraphAttentionLayer(
+            in_features=neighbor_dim,
+            out_features=gat_hidden,
+            num_heads=gat_heads,
+            dropout=dropout
+        )
+        
+        # MLP for action generation (no GRU)
+        input_dim = obs_dim + gat_heads * gat_hidden
+        layers = []
+        
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(input_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.Dropout(dropout))
+            input_dim = hidden_dim
+        
+        # Output layer
+        layers.append(nn.Linear(input_dim, action_dim))
+        
+        self.mlp = nn.Sequential(*layers)
+        
+        # Differentiable projection for constraints
+        self.projection = DifferentiableProjectionLayer(
+            num_links=action_dim,
+            total_power_budget=total_power_budget,
+            per_link_max=per_link_max
+        )
+    
+    def forward(self, obs: torch.Tensor,
+                neighbor_obs: Optional[torch.Tensor] = None,
+                neighbor_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Generate actions from observations (no hidden state needed).
+        
+        Args:
+            obs: Agent's observation (batch_size, obs_dim)
+            neighbor_obs: Neighbors' observations (batch_size, num_neighbors, neighbor_dim)
+            neighbor_mask: Valid neighbor mask (batch_size, num_neighbors)
+            
+        Returns:
+            Actions satisfying constraints (batch_size, action_dim)
+        """
+        batch_size = obs.size(0)
+        
+        # Process neighbor information if available
+        if neighbor_obs is not None and neighbor_obs.size(1) > 0:
+            # Use first neighbor's features as node features for attention
+            node_feat_for_gat = neighbor_obs[:, 0, :]
+            neighbor_context = self.gat(node_feat_for_gat, neighbor_obs, neighbor_mask)
+        else:
+            # No neighbors, create zero context
+            neighbor_context = torch.zeros(
+                batch_size, 
+                self.gat.num_heads * self.gat.out_features,
+                device=obs.device  # Ensure same device
+            )
+        
+        # Concatenate observation with neighbor context
+        combined_features = torch.cat([obs, neighbor_context], dim=-1)
+        
+        # Generate raw actions through MLP
+        raw_actions = self.mlp(combined_features)
+        
+        # Apply projection for constraint satisfaction
+        safe_actions = self.projection(raw_actions)
+        
+        return safe_actions
 class GATGRUEncoder(nn.Module):
     """
     Hierarchical encoder combining Graph Attention Networks and Gated Recurrent Units.
@@ -331,12 +433,10 @@ class DifferentiableProjectionLayer(nn.Module):
         return torch.stack(projected)
 
 
+# Modify existing ActorNetwork to support both modes
 class ActorNetwork(nn.Module):
     """
-    GA-MADDPG Actor Network with GAT-GRU encoder and differentiable projection.
-    
-    Maps local observations to deterministic actions while guaranteeing
-    constraint satisfaction through the projection layer.
+    GA-MADDPG Actor Network with optional GRU support.
     """
     
     def __init__(self, obs_dim: int, action_dim: int,
@@ -346,51 +446,54 @@ class ActorNetwork(nn.Module):
                  gru_hidden: int = 128,
                  total_power_budget: float = 1.0,
                  per_link_max: float = 0.5,
-                 use_cyclical_encoding: bool = True,
+                 use_gru: bool = True,  # NEW PARAMETER
+                 use_cyclical_encoding: bool = False,
                  cyclical_periods: Optional[Dict[int, float]] = None):
         """
+        Initialize actor network with optional GRU.
+        
         Args:
-            obs_dim: Dimension of agent's observation
-            action_dim: Dimension of action space (continuous part)
-            num_neighbors: Maximum number of neighbors
-            neighbor_dim: Dimension of neighbor features
-            hidden_dims: Hidden layer dimensions for MLP
-            gat_hidden: GAT hidden dimension
-            gat_heads: Number of GAT attention heads
-            gru_hidden: GRU hidden dimension
-            total_power_budget: Total power constraint
-            per_link_max: Per-link power constraint
-            use_cyclical_encoding: Whether to use cyclical encoding
-            cyclical_periods: Periods for cyclical features
+            use_gru: Whether to use GRU for temporal modeling (default True)
+            ... (other args unchanged)
         """
         super(ActorNetwork, self).__init__()
         
         self.obs_dim = obs_dim
         self.action_dim = action_dim
-        self.num_neighbors = num_neighbors
-        self.gru_hidden = gru_hidden
+        self.use_gru = use_gru
+        self.gru_hidden = gru_hidden if use_gru else 0
         
-        # Cyclical encoder for periodic features
+        # Cyclical encoder (if used)
         if use_cyclical_encoding and cyclical_periods:
             self.cyclical_encoder = CyclicalEncoder(cyclical_periods)
-            # Adjust input dimension based on cyclical encoding
-            encoded_dim = obs_dim + len(cyclical_periods)  # Each cyclical feature adds 1 dimension
+            encoded_dim = obs_dim + len(cyclical_periods)
         else:
             self.cyclical_encoder = None
             encoded_dim = obs_dim
         
-        # GAT-GRU encoder for belief state generation
-        self.encoder = GATGRUEncoder(
-            node_features=encoded_dim,
-            neighbor_features=neighbor_dim,
-            gat_hidden=gat_hidden,
-            gat_heads=gat_heads,
-            gru_hidden=gru_hidden
-        )
+        if self.use_gru:
+            # Use GAT-GRU encoder
+            self.encoder = GATGRUEncoder(
+                node_features=encoded_dim,
+                neighbor_features=neighbor_dim,
+                gat_hidden=gat_hidden,
+                gat_heads=gat_heads,
+                gru_hidden=gru_hidden
+            )
+            mlp_input_dim = gru_hidden
+            self.hidden_state = None
+        else:
+            # Use only GAT without GRU
+            self.gat = GraphAttentionLayer(
+                in_features=neighbor_dim,
+                out_features=gat_hidden,
+                num_heads=gat_heads
+            )
+            mlp_input_dim = encoded_dim + gat_heads * gat_hidden
         
         # MLP for action generation
         layers = []
-        input_dim = gru_hidden
+        input_dim = mlp_input_dim
         
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(input_dim, hidden_dim))
@@ -399,62 +502,58 @@ class ActorNetwork(nn.Module):
             layers.append(nn.Dropout(0.1))
             input_dim = hidden_dim
         
-        # Output layer for continuous actions
         layers.append(nn.Linear(input_dim, action_dim))
-        
         self.mlp = nn.Sequential(*layers)
         
-        # Differentiable projection for constraint satisfaction
+        # Projection layer
         self.projection = DifferentiableProjectionLayer(
             num_links=action_dim,
             total_power_budget=total_power_budget,
             per_link_max=per_link_max
         )
-        
-        # Hidden state for GRU
-        self.hidden_state = None
-        
+    
     def forward(self, obs: torch.Tensor,
                 neighbor_obs: Optional[torch.Tensor] = None,
                 neighbor_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Generate actions from observations.
-        
-        Args:
-            obs: Agent's observation (batch_size, obs_dim)
-            neighbor_obs: Neighbors' observations (batch_size, num_neighbors, neighbor_dim)
-            neighbor_mask: Valid neighbor mask (batch_size, num_neighbors)
-            
-        Returns:
-            Actions satisfying constraints (batch_size, action_dim)
-        """
-        batch_size = obs.size(0)
+        """Forward pass with optional GRU."""
         
         # Apply cyclical encoding if configured
         if self.cyclical_encoder is not None:
             obs = self.cyclical_encoder(obs)
         
-        # Generate belief state through GAT-GRU
-        belief_state, self.hidden_state = self.encoder(
-            node_obs=obs,
-            neighbor_obs=neighbor_obs,
-            hidden_state=self.hidden_state,
-            neighbor_mask=neighbor_mask
-        )
+        if self.use_gru:
+            # Use GAT-GRU encoder
+            belief_state, self.hidden_state = self.encoder(
+                node_obs=obs,
+                neighbor_obs=neighbor_obs,
+                hidden_state=self.hidden_state,
+                neighbor_mask=neighbor_mask
+            )
+            features = belief_state
+        else:
+            # Use GAT only
+            if neighbor_obs is not None and neighbor_obs.size(1) > 0:
+                node_feat = neighbor_obs[:, 0, :]
+                neighbor_context = self.gat(node_feat, neighbor_obs, neighbor_mask)
+            else:
+                neighbor_context = torch.zeros(
+                    obs.size(0),
+                    self.gat.num_heads * self.gat.out_features,
+                    device=obs.device
+                )
+            features = torch.cat([obs, neighbor_context], dim=-1)
         
-        # Generate raw actions through MLP
-        raw_actions = self.mlp(belief_state)
-        
-        # Apply differentiable projection for constraint satisfaction
+        # Generate actions
+        raw_actions = self.mlp(features)
         safe_actions = self.projection(raw_actions)
         
         return safe_actions
     
     def reset_hidden(self, batch_size: int = 1):
-        """Reset GRU hidden state."""
-        self.hidden_state = torch.zeros(1, batch_size, self.gru_hidden)
-        if next(self.parameters()).is_cuda:
-            self.hidden_state = self.hidden_state.cuda()
+        """Reset GRU hidden state (only if using GRU)."""
+        if self.use_gru:
+            device = next(self.parameters()).device
+            self.hidden_state = torch.zeros(1, batch_size, self.gru_hidden, device=device)
 
 
 class CriticNetwork(nn.Module):

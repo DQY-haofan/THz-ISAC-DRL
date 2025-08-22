@@ -344,20 +344,7 @@ class MADDPG_Agent:
     
     def learn(self, update_actor: bool = True) -> Dict[str, float]:
         """
-        Perform learning update for all agents.
-        
-        Implements the MADDPG training procedure:
-        1. Sample batch from replay buffer
-        2. Update all critics using TD-error
-        3. Update all actors using policy gradient from critics
-        4. Update reward decomposition network (if used)
-        5. Soft update target networks
-        
-        Args:
-            update_actor: Whether to update actor networks (can delay for stability)
-            
-        Returns:
-            Dictionary of training metrics
+        Perform learning update with gradient clipping and GPU support.
         """
         if not self.replay_buffer.is_ready(self.batch_size):
             return {}
@@ -371,28 +358,28 @@ class MADDPG_Agent:
         else:
             raise ValueError("Replay buffer must have sample method")
         
-        # Convert experiences to tensors
+        # Convert experiences to tensors and move to GPU
         obs_batch = torch.FloatTensor(
             np.array([e.observations for e in experiences])
-        ).to(self.device)
+        ).to(self.device)  # Move to GPU
         
         actions_batch = torch.FloatTensor(
             np.array([e.actions for e in experiences])
-        ).to(self.device)
+        ).to(self.device)  # Move to GPU
         
         rewards_batch = torch.FloatTensor(
             np.array([e.rewards for e in experiences])
-        ).to(self.device)
+        ).to(self.device)  # Move to GPU
         
         next_obs_batch = torch.FloatTensor(
             np.array([e.next_observations for e in experiences])
-        ).to(self.device)
+        ).to(self.device)  # Move to GPU
         
         dones_batch = torch.FloatTensor(
             np.array([e.dones for e in experiences])
-        ).to(self.device)
+        ).to(self.device)  # Move to GPU
         
-        is_weights = torch.FloatTensor(is_weights).to(self.device)
+        is_weights = torch.FloatTensor(is_weights).to(self.device)  # Move to GPU
         
         # Separate observations and actions for each agent
         agent_obs = [obs_batch[:, i] for i in range(self.num_agents)]
@@ -401,7 +388,7 @@ class MADDPG_Agent:
         agent_rewards = [rewards_batch[:, i] for i in range(self.num_agents)]
         agent_dones = [dones_batch[:, i] for i in range(self.num_agents)]
         
-        # Update critics
+        # Update critics with gradient clipping
         critic_losses = []
         td_errors = []
         
@@ -423,21 +410,20 @@ class MADDPG_Agent:
                 target_q = self.target_critics[i](agent_next_obs, target_actions_flat)
                 target_q = target_q.squeeze()
             
-            # Calculate target value with reward (potentially enhanced with difference reward)
+            # Calculate target value with reward
             if self.use_difference_rewards and self.reward_decomposer is not None:
                 # Compute difference reward
                 global_state = obs_batch.view(self.batch_size, -1)
                 agent_obs_i = agent_obs[i]
                 agent_action_i = agent_actions[i]
                 
-                # Use difference reward as enhancement
                 with torch.no_grad():
                     default_action = torch.zeros_like(agent_action_i)
                     diff_reward = self.reward_decomposer.compute_difference_reward(
                         global_state, agent_obs_i, agent_action_i, default_action
                     ).squeeze()
                 
-                enhanced_reward = agent_rewards[i] + 0.1 * diff_reward  # Weight can be tuned
+                enhanced_reward = agent_rewards[i] + 0.1 * diff_reward
             else:
                 enhanced_reward = agent_rewards[i]
             
@@ -455,19 +441,19 @@ class MADDPG_Agent:
             critic_loss = (is_weights * (td_error ** 2)).mean()
             critic_losses.append(critic_loss.item())
             
-            # Update critic
+            # Update critic with gradient clipping
             self.critic_optimizers[i].zero_grad()
             critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.critics[i].parameters(), 0.5)
+            # GRADIENT CLIPPING FOR STABILITY
+            torch.nn.utils.clip_grad_norm_(self.critics[i].parameters(), max_norm=1.0)
             self.critic_optimizers[i].step()
         
         # Update priorities in replay buffer
         if hasattr(self.replay_buffer, 'update_priorities'):
-            # Use maximum TD-error across agents for each transition
             max_td_errors = np.abs(np.max(td_errors, axis=0))
             self.replay_buffer.update_priorities(indices, max_td_errors)
         
-        # Update actors (can be delayed for stability)
+        # Update actors with gradient clipping
         actor_losses = []
         if update_actor and self.training_steps % 2 == 0:  # Update every 2 steps
             for i in range(self.num_agents):
@@ -479,41 +465,38 @@ class MADDPG_Agent:
                 actor_actions = []
                 for j in range(self.num_agents):
                     if j == i:
-                        # Use current actor for agent i
                         actor_action = self.actors[j](agent_obs[j])
                     else:
-                        # Use detached actions for other agents
                         actor_action = agent_actions[j].detach()
                     actor_actions.append(actor_action)
                 
                 actions_for_critic = torch.cat(actor_actions, dim=1)
                 
-                # Calculate actor loss (negative Q-value for gradient ascent)
+                # Calculate actor loss
                 actor_loss = -self.critics[i](agent_obs, actions_for_critic).mean()
                 actor_losses.append(actor_loss.item())
                 
-                # Update actor
+                # Update actor with gradient clipping
                 self.actor_optimizers[i].zero_grad()
                 actor_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.actors[i].parameters(), 0.5)
+                # GRADIENT CLIPPING FOR STABILITY
+                torch.nn.utils.clip_grad_norm_(self.actors[i].parameters(), max_norm=0.5)
                 self.actor_optimizers[i].step()
                 
                 # Unfreeze critic parameters
                 for param in self.critics[i].parameters():
                     param.requires_grad = True
         
-        # Update reward decomposition network
+        # Update reward decomposition network if used
         if self.use_difference_rewards and self.reward_decomposer is not None:
             global_state = obs_batch.view(self.batch_size, -1)
             
-            # Predict team reward for each agent's perspective
             reward_loss = 0
             for i in range(self.num_agents):
                 predicted_reward = self.reward_decomposer(
                     global_state, agent_obs[i], agent_actions[i]
                 ).squeeze()
                 
-                # Use mean team reward as target
                 team_reward = rewards_batch.mean(dim=1)
                 reward_loss += F.mse_loss(predicted_reward, team_reward)
             
@@ -521,6 +504,8 @@ class MADDPG_Agent:
             
             self.reward_optimizer.zero_grad()
             reward_loss.backward()
+            # Gradient clipping for reward network
+            torch.nn.utils.clip_grad_norm_(self.reward_decomposer.parameters(), max_norm=0.5)
             self.reward_optimizer.step()
             
             metrics['reward_loss'] = reward_loss.item()
@@ -537,7 +522,7 @@ class MADDPG_Agent:
         })
         
         return metrics
-    
+        
     def _soft_update_targets(self):
         """
         Perform soft update of target networks using Polyak averaging.

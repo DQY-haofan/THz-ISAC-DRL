@@ -1,100 +1,64 @@
-# LEO-ISAC MARL Training Configuration
-# =====================================
-# This YAML file configures all aspects of the training experiment
+# config.yml - LEO-ISAC MARL Configuration
 
+# Environment Configuration
 environment:
-  n_satellites: 4              # Number of satellites in constellation
-  altitude_km: 550            # Orbital altitude (km)
-  inclination_deg: 53.0       # Orbital inclination (degrees)
-  frequency_ghz: 300          # THz carrier frequency (GHz)
-  bandwidth_ghz: 10           # Signal bandwidth (GHz)
-  antenna_diameter_m: 0.5     # Antenna diameter (meters)
-  tx_power_dbm: 30           # Maximum transmit power (dBm)
-  noise_figure_db: 3.0       # Receiver noise figure (dB)
-  max_isl_range_km: 5000     # Maximum ISL range (km)
+  n_satellites: 4
+  altitude_km: 550
+  inclination_deg: 53.0
+  frequency_ghz: 300
+  bandwidth_ghz: 10
+  tx_power_dbm: 30
+  noise_figure_db: 3.0
+  max_isl_range_km: 5000
 
+# ISAC Task Configuration
 isac:
-  w_comm: 1.0                # Communication reward weight
-  w_sens: 0.5                # Sensing reward weight
-  w_penalty: 10.0            # Constraint violation penalty weight
+  w_comm: 1.0          # Communication reward weight
+  w_sens: 0.5          # Sensing reward weight
+  w_penalty: 10.0      # Constraint violation penalty weight
   sensing_mode: "cooperative_orbit_determination"
-  min_links_for_sensing: 3   # Minimum ISLs for 3D observability
+  min_links_for_sensing: 3
 
+# Agent Configuration
 agent:
-  # Actor network parameters
-  actor_lr: 0.0001           # Actor learning rate
-  actor_hidden_dims: [256, 128]
-  
-  # Critic network parameters
-  critic_lr: 0.001           # Critic learning rate
-  critic_hidden_dims: [512, 256, 128]
-  
-  # GAT-GRU parameters
+  actor_lr: 0.0001
+  critic_lr: 0.001
+  reward_lr: 0.001
+  tau: 0.005           # Soft update rate
+  gamma: 0.99          # Discount factor
+  buffer_capacity: 1000000
+  batch_size: 256
+  use_prioritized_replay: true
+  use_difference_rewards: true
+  use_gru: false       # Default to MLP baseline
+
+# Network Architecture
+network:
+  hidden_dims: [256, 128]
   gat_hidden: 64
   gat_heads: 4
   gru_hidden: 128
-  
-  # Training parameters
-  tau: 0.005                 # Soft update coefficient
-  gamma: 0.99                # Discount factor
-  buffer_capacity: 1000000   # Experience replay buffer size
-  batch_size: 256            # Training batch size
-  
-  # Advanced features
-  use_prioritized_replay: true
-  use_difference_rewards: true
-  share_encoder: true        # Share encoders between actor and critic
+  dropout: 0.1
 
+# Training Configuration
 training:
-  max_episodes: 1000         # Total training episodes
-  max_steps_per_episode: 100 # Steps per episode
-  warmup_episodes: 50        # Random exploration episodes
-  update_frequency: 1        # Learning updates per step
-  
-  # Exploration noise schedule
-  noise_decay_rate: 0.995    # Exploration noise decay
-  min_noise: 0.01           # Minimum exploration noise
-  
-  # Curriculum learning (optional)
-  curriculum_enabled: false
-  curriculum_stages: 3
+  max_episodes: 1000
+  max_steps_per_episode: 100
+  warmup_episodes: 50
+  update_frequency: 1
+  noise_decay_rate: 0.995
+  min_noise: 0.01
+  gradient_clip_norm: 0.5
 
+# Evaluation Configuration
 evaluation:
-  frequency: 50              # Evaluate every N episodes
-  episodes: 10               # Episodes per evaluation
-  benchmark_sca: true        # Compare with centralized SCA
-  compare_baselines: true    # Compare with baseline algorithms
-  
-  # Baselines to compare
-  baselines:
-    - random                 # Random power allocation
-    - equal                  # Equal power allocation
-    - greedy                 # Greedy power allocation
+  frequency: 50        # Evaluate every N episodes
+  episodes: 10         # Episodes per evaluation
+  benchmark_sca: true
+  compare_baselines: true
 
+# Logging Configuration
 logging:
-  log_dir: "./logs"          # Base directory for logs
-  save_frequency: 100        # Save models every N episodes
-  use_tensorboard: true      # Enable TensorBoard logging
-  verbose: true              # Verbose console output
-  
-  # Metrics to track
-  metrics:
-    - reward
-    - throughput
-    - gdop
-    - sinr
-    - power_efficiency
-    - convergence_time
-
-# Hardware configuration
-device: "cuda"               # Training device (cuda/cpu)
-num_workers: 4              # Parallel workers for data collection
-seed: 42                    # Random seed for reproducibility
-
-# Advanced options
-advanced:
-  use_amp: false            # Automatic mixed precision
-  gradient_clip: 0.5        # Gradient clipping value
-  checkpoint_interval: 200  # Checkpoint save interval
-  early_stopping: false     # Enable early stopping
-  patience: 50              # Early stopping patience
+  use_tensorboard: true
+  save_frequency: 100
+  verbose: true

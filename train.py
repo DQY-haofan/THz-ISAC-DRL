@@ -16,6 +16,7 @@ import argparse
 import yaml
 import os
 import json
+import csv
 import time
 from datetime import datetime
 from pathlib import Path
@@ -178,14 +179,31 @@ class LEOISACTrainer:
     Main trainer class that orchestrates the training and evaluation pipeline.
     """
     
-    def __init__(self, config: ExperimentConfig):
+    def __init__(self, config: ExperimentConfig, args: argparse.Namespace):
         """
-        Initialize the trainer with configuration.
+        Initialize trainer with config and command line arguments.
         
         Args:
-            config: Experiment configuration
+            config: Experiment configuration from YAML
+            args: Command line arguments (override config)
         """
         self.config = config
+        self.args = args
+        
+        # Override config with command line arguments
+        if args.n_satellites is not None:
+            self.config.n_satellites = args.n_satellites
+        if args.max_episodes is not None:
+            self.config.max_episodes = args.max_episodes
+        if args.batch_size is not None:
+            self.config.batch_size = args.batch_size
+        
+        # Set device
+        if args.device == 'auto':
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = torch.device(args.device)
+        print(f"Using device: {self.device}")
         
         # Create experiment directory
         self.experiment_dir = self._create_experiment_dir()
@@ -193,11 +211,24 @@ class LEOISACTrainer:
         # Save configuration
         self._save_config()
         
+        # Initialize CSV loggers
+        self.train_csv = CSVLogger(self.experiment_dir / 'logs', 'training.csv')
+        self.train_csv.initialize([
+            'episode', 'step', 'total_reward', 'comm_reward', 'sens_reward',
+            'throughput_gbps', 'gdop_m', 'sinr_db', 'loss_actor', 'loss_critic'
+        ])
+        
+        self.eval_csv = CSVLogger(self.experiment_dir / 'logs', 'evaluation.csv')
+        self.eval_csv.initialize([
+            'episode', 'algorithm', 'total_reward', 'throughput_gbps',
+            'gdop_m', 'sinr_db', 'convergence_time'
+        ])
+        
         # Initialize environment
         self.env = self._create_environment()
-        self.eval_env = self._create_environment()  # Separate env for evaluation
+        self.eval_env = self._create_environment()
         
-        # Initialize agent
+        # Initialize agent with device and GRU flag
         self.agent = self._create_agent()
         
         # Initialize baselines
@@ -276,7 +307,7 @@ class LEOISACTrainer:
         # Get dimensions from environment
         dummy_obs = self.env.reset()
         obs_dim = list(dummy_obs.values())[0].shape[0]
-        action_dim = 4  # Assuming max 4 links per agent
+        action_dim = 4  # Max 4 links per agent
         
         agent = MADDPG_Agent(
             num_agents=self.env.n_agents,
@@ -290,8 +321,14 @@ class LEOISACTrainer:
             batch_size=self.config.batch_size,
             use_prioritized_replay=self.config.use_per,
             use_difference_rewards=self.config.use_difference_rewards,
-            device=self.config.device
+            device=str(self.device),  # Pass device to agent
+            use_gru=self.args.use_gru  # Use command line flag for GRU
         )
+        
+        # Load checkpoint if resuming
+        if self.args.resume:
+            print(f"Loading checkpoint from {self.args.resume}")
+            agent.load_models(self.args.resume)
         
         return agent
     
@@ -865,42 +902,95 @@ class LEOISACTrainer:
         
         print(f"\nSummary report saved to {report_path}")
 
-
 def parse_arguments():
-    """Parse command line arguments."""
+    """Enhanced argument parser with all necessary options."""
     parser = argparse.ArgumentParser(
         description='Train LEO-ISAC Multi-Agent Reinforcement Learning System'
     )
     
-    # Environment arguments
-    parser.add_argument('--n_satellites', type=int, default=4,
-                       help='Number of satellites in constellation')
-    parser.add_argument('--altitude_km', type=float, default=550,
-                       help='Orbital altitude in kilometers')
-    parser.add_argument('--frequency_ghz', type=float, default=300,
-                       help='Carrier frequency in GHz')
-    
-    # Training arguments
-    parser.add_argument('--max_episodes', type=int, default=1000,
-                       help='Maximum number of training episodes')
-    parser.add_argument('--max_steps', type=int, default=100,
-                       help='Maximum steps per episode')
-    parser.add_argument('--batch_size', type=int, default=256,
-                       help='Batch size for training')
-    
-    # Logging arguments
+    # Core arguments
+    parser.add_argument('--config', type=str, default='config.yml',
+                       help='Path to YAML configuration file')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed for reproducibility')
     parser.add_argument('--log_dir', type=str, default='./logs',
                        help='Directory for logs and results')
+    parser.add_argument('--device', type=str, default='auto',
+                       choices=['cpu', 'cuda', 'auto'],
+                       help='Training device (auto detects CUDA)')
+    
+    # Environment arguments
+    parser.add_argument('--n_satellites', type=int, default=None,
+                       help='Override number of satellites from config')
+    parser.add_argument('--use_gru', action='store_true',
+                       help='Use GRU in actor/critic networks')
+    parser.add_argument('--no_gru', dest='use_gru', action='store_false',
+                       help='Use MLP baseline without GRU')
+    parser.set_defaults(use_gru=False)  # Default to MLP for stability
+    
+    # Training arguments
+    parser.add_argument('--max_episodes', type=int, default=None,
+                       help='Override maximum episodes from config')
+    parser.add_argument('--batch_size', type=int, default=None,
+                       help='Override batch size from config')
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Path to checkpoint to resume from')
+    
+    # Logging arguments
     parser.add_argument('--verbose', action='store_true',
                        help='Enable verbose output')
-    parser.add_argument('--use_tensorboard', action='store_true',
-                       help='Enable TensorBoard logging')
-    
-    # Configuration file
-    parser.add_argument('--config', type=str, default=None,
-                       help='Path to YAML configuration file')
+    parser.add_argument('--no_tensorboard', action='store_true',
+                       help='Disable TensorBoard logging')
+    parser.add_argument('--save_freq', type=int, default=100,
+                       help='Model save frequency (episodes)')
     
     return parser.parse_args()
+
+
+def setup_reproducibility(seed: int):
+    """Set random seeds for reproducibility."""
+    import random
+    import torch
+    
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    
+    print(f"Random seed set to {seed} for reproducibility")
+
+
+class CSVLogger:
+    """Simple CSV logger for training metrics."""
+    
+    def __init__(self, log_dir: Path, filename: str):
+        """Initialize CSV logger."""
+        self.log_path = log_dir / filename
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.file = None
+        self.writer = None
+        
+    def initialize(self, fieldnames: List[str]):
+        """Initialize CSV with headers."""
+        self.file = open(self.log_path, 'w', newline='')
+        self.writer = csv.DictWriter(self.file, fieldnames=fieldnames)
+        self.writer.writeheader()
+        self.file.flush()
+    
+    def log(self, data: Dict):
+        """Log a row of data."""
+        if self.writer:
+            self.writer.writerow(data)
+            self.file.flush()
+    
+    def close(self):
+        """Close the CSV file."""
+        if self.file:
+            self.file.close()
 
 
 def main():
