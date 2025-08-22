@@ -257,10 +257,7 @@ def main():
     print("LEO-ISAC MARL System - Smoke Test")
     print("=" * 60)
     
-    # Check dependencies
-    if not check_dependencies():
-        print("Please install missing dependencies first!")
-        return 1
+
     
     # Check if test config exists
     if not Path("test_config.yml").exists():
