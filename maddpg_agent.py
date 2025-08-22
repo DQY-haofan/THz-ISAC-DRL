@@ -90,24 +90,25 @@ class MADDPG_Agent:
     """
     
     def __init__(self,
-                 num_agents: int,
-                 obs_dim: int,
-                 action_dim: int,
-                 num_neighbors: int = 4,
-                 neighbor_dim: int = 10,
-                 actor_lr: float = 1e-4,
-                 critic_lr: float = 1e-3,
-                 reward_lr: float = 1e-3,
-                 tau: float = 0.005,
-                 gamma: float = 0.99,
-                 buffer_capacity: int = 1000000,
-                 batch_size: int = 256,
-                 use_prioritized_replay: bool = True,
-                 use_difference_rewards: bool = True,
-                 share_encoder: bool = True,
-                 total_power_budget: float = 1.0,
-                 per_link_max: float = 0.5,
-                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
+                num_agents: int,
+                obs_dim: int,
+                action_dim: int,
+                num_neighbors: int = 4,
+                neighbor_dim: int = 10,
+                actor_lr: float = 1e-4,
+                critic_lr: float = 1e-3,
+                reward_lr: float = 1e-3,
+                tau: float = 0.005,
+                gamma: float = 0.99,
+                buffer_capacity: int = 1000000,
+                batch_size: int = 256,
+                use_prioritized_replay: bool = True,
+                use_difference_rewards: bool = True,
+                use_gru: bool = False,  # 添加这一行
+                share_encoder: bool = True,
+                total_power_budget: float = 1.0,
+                per_link_max: float = 0.5,
+                device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
         """
         Initialize MADDPG agent system.
         
@@ -126,6 +127,7 @@ class MADDPG_Agent:
             batch_size: Training batch size
             use_prioritized_replay: Whether to use PER
             use_difference_rewards: Whether to use learned difference rewards
+            use_gru: Whether to use GRU for temporal modeling  # 添加这一行
             share_encoder: Whether actors and critics share encoders
             total_power_budget: Total power constraint for projection layer
             per_link_max: Per-link power constraint
@@ -139,6 +141,7 @@ class MADDPG_Agent:
         self.tau = tau
         self.device = torch.device(device)
         self.use_difference_rewards = use_difference_rewards
+        self.use_gru = use_gru  # 添加这一行
         
         # Initialize networks for each agent
         self.actors = []
@@ -160,6 +163,7 @@ class MADDPG_Agent:
                 neighbor_dim=neighbor_dim,
                 total_power_budget=total_power_budget,
                 per_link_max=per_link_max,
+                use_gru=use_gru,  # 添加这一行
                 use_cyclical_encoding=False  # Can be configured
             ).to(self.device)
             
@@ -176,7 +180,7 @@ class MADDPG_Agent:
             
             # Store shared encoder from first agent
             if i == 0 and share_encoder:
-                shared_encoder = actor.encoder
+                shared_encoder = actor.encoder if use_gru else None  # 修改这一行
             
             # Create target networks (deep copy to avoid reference issues)
             target_actor = deepcopy(actor)
