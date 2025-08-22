@@ -32,7 +32,7 @@ from interference import (
     calculate_normalized_interference_coeff
 )
 from performance_model import (
-    calculate_effective_sinr, calculate_range_variance
+    calculate_effective_sinr, calculate_range_variance_m2
 )
 from fim import (
     InformationFilter, build_jacobian, update_info,
