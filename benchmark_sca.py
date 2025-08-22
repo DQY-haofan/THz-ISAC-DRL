@@ -836,8 +836,7 @@ if __name__ == "__main__":
     
     print(f"  Total utility: {centralized_solution.total_utility:.6f}")
     print(f"  Average SINR: {np.mean(list(centralized_solution.achieved_sinr.values())):.2f}")
-    print(f"  Power efficiency: {sum(centralized_solution.power_allocation.values())
-          f"sum(state.power_budgets.values()):.2%}")
+    print(f"  Power efficiency: {sum(centralized_solution.power_allocation.values()) / sum(state.power_budgets.values()):.2%}")
     
     # Compare with naive equal allocation
     print("\nNaive Equal Allocation (Baseline):")
