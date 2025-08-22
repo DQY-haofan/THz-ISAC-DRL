@@ -1004,7 +1004,7 @@ def main():
         config = ExperimentConfig.from_args(args)
     
     # Create and run trainer
-    trainer = LEOISACTrainer(config)
+    trainer = LEOISACTrainer(config, args)
     trainer.train()
 
 
