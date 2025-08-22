@@ -446,10 +446,10 @@ class LEOISACTrainer:
             # Convert actions to environment format
             action_dict = {}
             for i, agent_id in enumerate(self.env.agent_ids):
-                # Get active links for this agent
+                # Get active links for this agent (使用 link_registry 而不是 link_states)
                 agent_links = [
-                    lid for lid, ls in self.env.link_states.items()
-                    if ls['tx'] == agent_id
+                    lid for lid, (tx, rx) in self.env.link_registry.items()
+                    if tx == agent_id
                 ]
                 
                 # Create power allocation dictionary
@@ -484,7 +484,7 @@ class LEOISACTrainer:
             
             # Learn from experience
             if episode >= self.config.warmup_episodes and \
-               step % self.config.update_frequency == 0:
+            step % self.config.update_frequency == 0:
                 learn_metrics = self.agent.learn()
                 for key, value in learn_metrics.items():
                     episode_metrics[f'learn_{key}'].append(value)
@@ -590,9 +590,10 @@ class LEOISACTrainer:
                 # Convert to environment format
                 action_dict = {}
                 for i, agent_id in enumerate(self.eval_env.agent_ids):
+                    # 使用 link_registry 而不是 link_states
                     agent_links = [
-                        lid for lid, ls in self.eval_env.link_states.items()
-                        if ls['tx'] == agent_id
+                        lid for lid, (tx, rx) in self.eval_env.link_registry.items()
+                        if tx == agent_id
                     ]
                     
                     power_alloc = {}
@@ -658,9 +659,10 @@ class LEOISACTrainer:
                 # Convert to environment format
                 action_dict = {}
                 for i, agent_id in enumerate(self.eval_env.agent_ids):
+                    # 使用 link_registry 而不是 link_states
                     agent_links = [
-                        lid for lid, ls in self.eval_env.link_states.items()
-                        if ls['tx'] == agent_id
+                        lid for lid, (tx, rx) in self.eval_env.link_registry.items()
+                        if tx == agent_id
                     ]
                     
                     power_alloc = {}
