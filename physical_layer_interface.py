@@ -476,72 +476,50 @@ class PhysicalLayerInterface:
         # Phase 4: 更新网络FIM用于感知
         self._update_network_fim()
         
+
     def _compute_link_metrics(self):
         """Compute basic metrics for all active links."""
         
-        # Create mapping of link IDs to (tx, rx) pairs
-        link_mapping = {}
-        for tx_id, rx_id in self.active_links:
-            link_id = f"{tx_id}->{rx_id}"
-            link_mapping[link_id] = (tx_id, rx_id)
-        
-        # Compute metrics for each link
+        # 遍历 link_registry 以处理所有定义的链路
         for link_id, (tx_id, rx_id) in self.link_registry.items():
-            # Get power allocation
+            
+            # --- START OF CORRECTION ---
+            #
+            # 步骤 1: 无论功率如何，首先计算基础几何，这是所有后续计算的基础
+            #
+            tx_idx = self._get_satellite_index(tx_id)
+            rx_idx = self._get_satellite_index(rx_id)
+            
+            tx_pos = self.satellite_states[tx_idx*8:tx_idx*8+3]
+            rx_pos = self.satellite_states[rx_idx*8:rx_idx*8+3]
+            
+            distance = np.linalg.norm(rx_pos - tx_pos)
+            
+            # 步骤 2: 获取此链路的发射功率
+            #
             tx_power = 0.0
             if tx_id in self.power_allocations:
-                # ... (这段代码保持不变) ...
                 power_alloc = self.power_allocations[tx_id].get('power_allocation', {})
                 tx_power = power_alloc.get(link_id, 0.0)
             
-            # --- START OF CORRECTION ---
+            # 步骤 3: 根据功率，计算信道增益和SNR0
+            #
+            if tx_power > 0:
+                channel_gain = calculate_channel_gain(
+                    distance,
+                    self.frequency_hz,
+                    self.antenna_gain,
+                    self.antenna_gain,
+                    self.hw_profile.sigma_e,
+                    self.beamwidth
+                )
+                snr0 = (tx_power * channel_gain) / self.noise_power
+            else:
+                channel_gain = 0.0
+                snr0 = 0.0
 
-            # 获取卫星位置，即使功率为零也需要计算距离
-            tx_idx = self._get_satellite_index(tx_id)
-            rx_idx = self._get_satellite_index(rx_id)
-            tx_pos = self.satellite_states[tx_idx*8:tx_idx*8+3]
-            rx_pos = self.satellite_states[rx_idx*8:rx_idx*8+3]
-            distance = np.linalg.norm(rx_pos - tx_pos)
-
-            if tx_power <= 0:
-                # 即使功率为零，也要填充默认指标，以确保link_metrics字典的完整性
-                self.link_metrics[link_id] = {
-                    'tx_id': tx_id,
-                    'rx_id': rx_id,
-                    'tx_power': 0.0,
-                    'channel_gain': 0.0,
-                    'distance': distance,
-                    'snr0': 0.0,
-                    'interference': 0.0,  # 会在后续步骤中更新
-                    'sinr_eff': 0.0,
-                    'range_variance': np.inf
-                }
-                continue # 现在可以安全地跳过
-                
-            # Get satellite indices and positions
-            tx_idx = self._get_satellite_index(tx_id)
-            rx_idx = self._get_satellite_index(rx_id)
-            
-            tx_pos = self.satellite_states[tx_idx*8:tx_idx*8+3]
-            rx_pos = self.satellite_states[rx_idx*8:rx_idx*8+3]
-            
-            # Calculate distance
-            distance = np.linalg.norm(rx_pos - tx_pos)
-            
-            # Calculate channel gain
-            channel_gain = calculate_channel_gain(
-                distance,
-                self.frequency_hz,
-                self.antenna_gain,
-                self.antenna_gain,
-                self.hw_profile.sigma_e,
-                self.beamwidth
-            )
-            
-            # Pre-impairment SNR
-            snr0 = (tx_power * channel_gain) / self.noise_power
-            
-            # Store initial metrics
+            # 步骤 4: 无论功率如何，都为链路创建指标条目，确保字典完整
+            #
             self.link_metrics[link_id] = {
                 'tx_id': tx_id,
                 'rx_id': rx_id,
@@ -549,10 +527,12 @@ class PhysicalLayerInterface:
                 'channel_gain': channel_gain,
                 'distance': distance,
                 'snr0': snr0,
-                'interference': 0.0,  # Will be updated
-                'sinr_eff': snr0,  # Initial estimate
-                'range_variance': np.inf  # Will be updated
+                'interference': 0.0,
+                'sinr_eff': snr0,      # 初始估计
+                'range_variance': np.inf 
             }
+            #
+            # --- END OF CORRECTION ---
     
     # def _compute_interference_matrix(self):
     #     """
