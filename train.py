@@ -12,7 +12,15 @@ Author: THz ISAC Research Team
 Date: August 2025
 """
 import sys
-from tqdm import tqdm
+try:
+    import google.colab
+    IN_COLAB = True
+    from tqdm.notebook import tqdm  # Use notebook version for Colab
+    print("✓ Running in Google Colab - using notebook progress bars")
+except ImportError:
+    IN_COLAB = False
+    from tqdm import tqdm  # Use standard tqdm
+    print("✓ Running in standard environment - using terminal progress bars")
 import time
 import argparse
 import yaml
@@ -358,10 +366,9 @@ class LEOISACTrainer:
         
         return logger
     
-
     def train(self):
         """
-        Main training loop with progress bars output to stderr.
+        Main training loop with Colab-compatible progress bars.
         """
         print("=" * 70)
         print("Starting LEO-ISAC MARL Training")
@@ -369,39 +376,34 @@ class LEOISACTrainer:
         print(f"Device: {self.config.device}")
         print(f"Agents: {self.env.n_agents}")
         print("=" * 70)
-        sys.stdout.flush()  # Ensure header is printed immediately
         
-        # Create main progress bar for episodes (output to stderr)
+        # Initialize metrics for tracking
+        best_reward = -float('inf')
+        recent_rewards = []
+        training_history = []
+        
+        # Create main progress bar (Colab-compatible)
         episode_pbar = tqdm(
             range(self.config.max_episodes),
             desc="Training Episodes",
             unit="ep",
-            ncols=100,
-            position=0,
-            leave=True,
-            file=sys.stderr  # Output to stderr for immediate display
+            leave=True
         )
-        
-        # Initialize metrics for progress bar display
-        best_reward = -float('inf')
-        recent_rewards = []
         
         for episode in episode_pbar:
             episode_start = time.time()
             
-            # Run training episode with its own progress bar
+            # Run training episode
             episode_reward, episode_metrics = self._run_training_episode(episode)
             
-            # Track recent rewards for moving average
+            # Track metrics
             recent_rewards.append(episode_reward)
             if len(recent_rewards) > 100:
                 recent_rewards.pop(0)
             
-            # Update best reward
             if episode_reward > best_reward:
                 best_reward = episode_reward
             
-            # Calculate moving average
             avg_reward = np.mean(recent_rewards[-10:]) if recent_rewards else 0
             
             # Update exploration noise
@@ -410,7 +412,16 @@ class LEOISACTrainer:
             # Log training progress
             self._log_training(episode, episode_reward, episode_metrics)
             
-            # Update progress bar with key metrics
+            # Store history for plotting
+            training_history.append({
+                'episode': episode,
+                'reward': episode_reward,
+                'avg_reward': avg_reward,
+                'throughput': episode_metrics.get('throughput', 0),
+                'gdop': episode_metrics.get('gdop', np.inf)
+            })
+            
+            # Update progress bar description with metrics
             episode_pbar.set_postfix({
                 'R': f'{episode_reward:.2f}',
                 'Avg': f'{avg_reward:.2f}',
@@ -421,45 +432,34 @@ class LEOISACTrainer:
             
             # Periodic evaluation
             if (episode + 1) % self.config.eval_frequency == 0:
-                # Clear line for clean output
-                print("\n" + "=" * 70, file=sys.stderr)
-                print(f"Evaluation at Episode {episode + 1}", file=sys.stderr)
-                print("=" * 70, file=sys.stderr)
-                sys.stderr.flush()
-                
+                print(f"\n{'='*70}")
+                print(f"Evaluation at Episode {episode + 1}")
+                print(f"{'='*70}")
                 self._evaluate(episode)
-                
-                print("=" * 70 + "\n", file=sys.stderr)
-                sys.stderr.flush()
+                print(f"{'='*70}\n")
             
             # Save models
             if (episode + 1) % self.config.save_frequency == 0:
                 self._save_models(episode)
                 if self.config.verbose:
-                    tqdm.write(f"✓ Models saved at episode {episode + 1}", file=sys.stderr)
+                    print(f"✓ Models saved at episode {episode + 1}")
             
-            # Print detailed progress every 10 episodes
-            if self.config.verbose and episode % 10 == 0 and episode > 0:
+            # Periodic status update for Colab
+            if IN_COLAB and episode % 10 == 0 and episode > 0:
                 episode_time = time.time() - episode_start
-                tqdm.write(
-                    f"\n[Episode {episode}] "
+                print(f"\n[Episode {episode}] "
                     f"Reward: {episode_reward:.2f} | "
                     f"Avg(10): {avg_reward:.2f} | "
                     f"Throughput: {episode_metrics.get('throughput', 0):.2f} Gbps | "
-                    f"GDOP: {episode_metrics.get('gdop', np.inf):.1f} m | "
-                    f"Time: {episode_time:.2f}s\n",
-                    file=sys.stderr
-                )
+                    f"Time: {episode_time:.2f}s")
         
-        # Close progress bar
-        episode_pbar.close()
+        # Store training history for analysis
+        self.training_history = training_history
         
         # Final evaluation
         print("\n" + "=" * 70)
         print("Training Complete - Running Final Evaluation")
         print("=" * 70)
-        sys.stdout.flush()
-        
         self._evaluate(self.config.max_episodes, final=True)
         
         # Save final models
@@ -468,20 +468,75 @@ class LEOISACTrainer:
         # Generate summary report
         self._generate_summary_report()
         
+        # Plot training curves if in Colab
+        if IN_COLAB:
+            self._plot_training_curves()
+        
         print("\n✓ Training completed successfully!")
         print(f"Results saved to: {self.experiment_dir}")
-        sys.stdout.flush()
-
     
+    def _plot_training_curves(self):
+        """Plot training curves (for Colab visualization)."""
+        if not hasattr(self, 'training_history') or not self.training_history:
+            return
+        
+        try:
+            import matplotlib.pyplot as plt
+            
+            history = self.training_history
+            episodes = [h['episode'] for h in history]
+            rewards = [h['reward'] for h in history]
+            avg_rewards = [h['avg_reward'] for h in history]
+            throughputs = [h['throughput'] for h in history]
+            
+            fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+            
+            # Rewards
+            axes[0, 0].plot(episodes, rewards, alpha=0.3, label='Raw')
+            axes[0, 0].plot(episodes, avg_rewards, label='Avg(10)', linewidth=2)
+            axes[0, 0].set_xlabel('Episode')
+            axes[0, 0].set_ylabel('Reward')
+            axes[0, 0].set_title('Training Rewards')
+            axes[0, 0].legend()
+            axes[0, 0].grid(True, alpha=0.3)
+            
+            # Throughput
+            axes[0, 1].plot(episodes, throughputs)
+            axes[0, 1].set_xlabel('Episode')
+            axes[0, 1].set_ylabel('Throughput (Gbps)')
+            axes[0, 1].set_title('Communication Performance')
+            axes[0, 1].grid(True, alpha=0.3)
+            
+            # GDOP (if available)
+            gdops = [h['gdop'] for h in history]
+            valid_gdops = [g if g < np.inf else np.nan for g in gdops]
+            if any(not np.isnan(g) for g in valid_gdops):
+                axes[1, 0].plot(episodes, valid_gdops)
+                axes[1, 0].set_xlabel('Episode')
+                axes[1, 0].set_ylabel('GDOP (m)')
+                axes[1, 0].set_title('Sensing Performance')
+                axes[1, 0].set_yscale('log')
+                axes[1, 0].grid(True, alpha=0.3)
+            
+            # Learning curve
+            axes[1, 1].plot(episodes, np.cumsum(rewards) / (np.arange(len(rewards)) + 1))
+            axes[1, 1].set_xlabel('Episode')
+            axes[1, 1].set_ylabel('Average Return')
+            axes[1, 1].set_title('Cumulative Average Return')
+            axes[1, 1].grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig(self.experiment_dir / 'training_curves.png', dpi=150)
+            plt.show()
+            
+            print("✓ Training curves plotted")
+            
+        except ImportError:
+            print("Matplotlib not available, skipping plots")
+
     def _run_training_episode(self, episode: int) -> Tuple[float, Dict]:
         """
-        Run a single training episode with step-level progress bar output to stderr.
-        
-        Args:
-            episode: Episode number
-            
-        Returns:
-            Total episode reward and metrics
+        Run a single training episode (simplified progress for Colab).
         """
         # Reset environment and agent
         observations = self.env.reset()
@@ -491,28 +546,28 @@ class LEOISACTrainer:
         episode_reward = 0
         episode_metrics = defaultdict(list)
         
-        # Convert observations to list format for agent
+        # Convert observations to list format
         obs_list = [observations[agent_id] for agent_id in self.env.agent_ids]
         
-        # Create progress bar for steps within episode (output to stderr)
-        step_pbar = tqdm(
-            range(self.config.max_steps),
-            desc=f"  Ep{episode:03d} Steps",
-            unit="st",
-            ncols=100,
-            position=1,
-            leave=False,
-            file=sys.stderr,  # Output to stderr
-            disable=not self.config.verbose  # Only show if verbose
-        )
+        # In Colab, use simpler progress indication
+        if IN_COLAB and self.config.verbose and episode % 10 == 0:
+            # Only show progress bar for every 10th episode to reduce clutter
+            steps = range(self.config.max_steps)
+            show_progress = True
+        else:
+            steps = range(self.config.max_steps)
+            show_progress = False
+        
+        if show_progress:
+            step_pbar = tqdm(steps, desc=f"  Episode {episode}", leave=False)
+        else:
+            step_pbar = steps
         
         for step in step_pbar:
-            # Select actions with exploration noise
+            # Select actions
             if episode < self.config.warmup_episodes:
-                # Random exploration during warmup
                 actions = np.random.rand(self.env.n_agents, 4) * 0.3
             else:
-                # Use policy with exploration noise
                 actions = self.agent.select_actions(
                     obs_list,
                     add_noise=True,
@@ -522,15 +577,13 @@ class LEOISACTrainer:
             # Convert actions to environment format
             action_dict = {}
             for i, agent_id in enumerate(self.env.agent_ids):
-                # Get active links for this agent
                 agent_links = [
                     lid for lid, (tx, rx) in self.env.link_registry.items()
                     if tx == agent_id
                 ]
                 
-                # Create power allocation dictionary
                 power_alloc = {}
-                for j, link_id in enumerate(agent_links[:4]):  # Max 4 links
+                for j, link_id in enumerate(agent_links[:4]):
                     if j < len(actions[i]):
                         power_alloc[link_id] = float(actions[i][j])
                 
@@ -542,7 +595,7 @@ class LEOISACTrainer:
             # Environment step
             next_observations, rewards, done, info = self.env.step(action_dict)
             
-            # Convert to list format
+            # Convert to arrays
             next_obs_list = [next_observations[agent_id] for agent_id in self.env.agent_ids]
             rewards_array = np.array([rewards[agent_id] for agent_id in self.env.agent_ids])
             dones_array = np.array([done] * self.env.n_agents)
@@ -565,20 +618,12 @@ class LEOISACTrainer:
                 for key, value in learn_metrics.items():
                     episode_metrics[f'learn_{key}'].append(value)
             
-            # Accumulate rewards and metrics
+            # Accumulate metrics
             step_reward = np.mean(rewards_array)
             episode_reward += step_reward
             episode_metrics['throughput'].append(info.get('total_throughput', 0))
             episode_metrics['gdop'].append(info.get('gdop', np.inf))
             episode_metrics['active_links'].append(info.get('n_active_links', 0))
-            
-            # Update step progress bar with compact metrics
-            step_pbar.set_postfix({
-                'r': f'{step_reward:.3f}',
-                'R': f'{episode_reward:.2f}',
-                'T': f"{info.get('total_throughput', 0):.1f}",
-                'L': info.get('n_active_links', 0)
-            }, refresh=True)
             
             # Update observations
             obs_list = next_obs_list
@@ -586,17 +631,11 @@ class LEOISACTrainer:
             if done:
                 break
         
-        # Close step progress bar
-        step_pbar.close()
-        
         # Aggregate episode metrics
         aggregated_metrics = {}
         for key, values in episode_metrics.items():
             if values:
-                if key.startswith('learn_'):
-                    aggregated_metrics[key] = np.mean(values)
-                else:
-                    aggregated_metrics[key] = np.mean(values)
+                aggregated_metrics[key] = np.mean(values)
         
         return episode_reward, aggregated_metrics
     

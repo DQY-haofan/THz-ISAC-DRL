@@ -435,7 +435,6 @@ class UniformReplayBuffer:
     Standard uniform replay buffer for comparison baseline.
     
     Samples experiences uniformly at random without prioritization.
-    Provided for comparison with prioritized replay.
     """
     
     def __init__(self, capacity: int = 1000000):
@@ -455,27 +454,35 @@ class UniformReplayBuffer:
         self.buffer.append(experience)
         self.total_added += 1
     
-    def sample(self, batch_size: int) -> Tuple[List[Experience], np.ndarray, None]:
+    def sample(self, batch_size: int) -> Tuple[List[Experience], np.ndarray, np.ndarray]:
         """
         Sample batch uniformly at random.
+        
+        FIXED VERSION: Returns proper tuple format matching PrioritizedReplayBuffer
         
         Args:
             batch_size: Number of experiences to sample
             
         Returns:
-            Tuple of (experiences, uniform weights, None)
+            Tuple of (experiences, uniform weights, dummy indices)
         """
         if len(self.buffer) < batch_size:
             raise ValueError(f"Not enough samples: {len(self.buffer)} < {batch_size}")
         
+        # Sample experiences
         experiences = random.sample(self.buffer, batch_size)
         
         # Uniform weights (all equal to 1.0)
         weights = np.ones(batch_size, dtype=np.float32)
         
+        # Dummy indices for compatibility
+        indices = np.arange(batch_size)
+        
         self.total_sampled += batch_size
         
-        return experiences, weights, None
+        # IMPORTANT: Return tuple of (experiences, weights, indices)
+        # This matches the format expected by MADDPG's learn() method
+        return experiences, weights, indices
     
     def __len__(self) -> int:
         """Get current buffer size."""
