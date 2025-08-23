@@ -2,7 +2,7 @@
 
 # Environment Configuration (Minimal 2-satellite setup)
 environment:
-  n_satellites: 5          # Simplest possible network
+  n_satellites: 128          # Simplest possible network
   altitude_km: 550         # Standard LEO altitude
   inclination_deg: 0.0     # Equatorial orbit for simplicity
   frequency_ghz: 300       # THz band
