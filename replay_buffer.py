@@ -39,6 +39,8 @@ class Experience(NamedTuple):
     next_observations: np.ndarray
     dones: np.ndarray
     info: Optional[Dict] = None
+    privileged_info: Optional[np.ndarray] = None  # 新增字段
+
 
 
 class SumTree:

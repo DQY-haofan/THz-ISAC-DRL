@@ -312,7 +312,7 @@ class LEO_ISAC_Env:
     
     def _compute_rewards(self, actions: Dict) -> Dict[str, float]:
         """
-        Compute ISAC rewards with improved sensing reward based on D-optimality.
+        Compute ISAC rewards with theoretically consistent sensing reward.
         """
         rewards = {}
         
@@ -320,8 +320,8 @@ class LEO_ISAC_Env:
             # Communication reward (unchanged)
             r_comm = self.phy_interface.get_total_comm_reward(agent_id)
             
-            # Enhanced sensing reward based on D-optimality
-            r_sens = self._compute_sensing_reward_d_optimal(agent_id)
+            # Sensing reward based on A-optimality (renamed method)
+            r_sens = self._compute_sensing_reward_a_optimal(agent_id)
             
             # Calculate penalty for constraint violation
             r_penalty = 0.0
@@ -341,12 +341,24 @@ class LEO_ISAC_Env:
             )
         
         return rewards
-    def _compute_sensing_reward_d_optimal(self, agent_id: str) -> float:
+    
+
+    def _compute_sensing_reward_a_optimal(self, agent_id: str) -> float:
         """
-        Compute sensing reward based on D-optimality (minimize det(CRLB)).
+        Compute sensing reward based on A-optimality (minimize trace of CRLB).
         
-        D-optimal design minimizes the volume of the error ellipsoid,
-        which is proportional to sqrt(det(CRLB)) = 1/sqrt(det(FIM)).
+        A-optimal design minimizes the trace of the CRLB matrix,
+        which corresponds to minimizing the sum of estimation error variances.
+        This is implemented as a proxy using the trace of FIM contributions.
+        
+        Note: The reward is based on trace(J_link), which relates to A-optimality
+        (minimizing trace of CRLB), not D-optimality (minimizing determinant of CRLB).
+        
+        Args:
+            agent_id: Agent identifier
+            
+        Returns:
+            Sensing reward based on FIM trace contribution
         """
         try:
             # Get current network FIM from physical layer
@@ -357,25 +369,25 @@ class LEO_ISAC_Env:
                 agent_contribution = 0.0
                 for link_id, metrics in self.phy_interface.link_metrics.items():
                     if metrics['tx_id'] == agent_id:
-                        # Use log-det for numerical stability
-                        # Reward is proportional to information gain
+                        # Get FIM contribution from this link
                         J_link = self.phy_interface.get_fim_contribution(link_id)
                         if J_link is not None:
-                            # Simple proxy: trace of FIM contribution
+                            # A-optimality: minimize trace(CRLB) = minimize trace(J^-1)
+                            # As proxy, we maximize trace(J) which relates to information gain
                             agent_contribution += np.trace(J_link) / self.n_agents
                 
-                # Normalize by network size
+                # Normalize by network size and apply logarithmic scaling
                 reward = np.log(1 + agent_contribution)
             else:
                 # No valid FIM, return zero reward
                 reward = 0.0
                 
         except Exception as e:
-            warnings.warn(f"Error computing D-optimal reward: {e}")
+            warnings.warn(f"Error computing A-optimal reward: {e}")
             reward = 0.0
         
         return reward
-    
+
     
     def _compute_observations(self) -> Dict[str, np.ndarray]:
         """
@@ -512,7 +524,11 @@ class LEO_ISAC_Env:
                 )
     
     def _collect_info(self) -> Dict:
-        """Collect additional information from physical layer."""
+        """
+        Collect additional information from physical layer including privileged information.
+        
+        This includes the true global interference matrix for centralized critic training.
+        """
         info = {
             'time': self.current_time,
             'step': self.episode_step,
@@ -525,6 +541,24 @@ class LEO_ISAC_Env:
         for link_id in self.link_registry:
             total_throughput += self.phy_interface.get_throughput_gbps(link_id)
         info['total_throughput'] = total_throughput
+        
+        # 添加特权信息：真实的全局干扰矩阵
+        # 提取所有αℓm值并展平为向量
+        interference_matrix_flat = []
+        for victim_link in self.link_registry:
+            for interferer_link in self.link_registry:
+                if victim_link != interferer_link:
+                    alpha_lm = self.phy_interface.get_interference_coefficient(
+                        victim_link, interferer_link
+                    )
+                    interference_matrix_flat.append(alpha_lm)
+        
+        info['interference_matrix'] = np.array(interference_matrix_flat, dtype=np.float32)
+        
+        # 添加其他有用的全局信息
+        info['link_sinrs'] = {}
+        for link_id in self.link_registry:
+            info['link_sinrs'][link_id] = self.phy_interface.get_effective_sinr(link_id)
         
         return info
     

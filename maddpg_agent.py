@@ -326,7 +326,7 @@ class MADDPG_Agent:
                         dones: np.ndarray,
                         info: Optional[Dict] = None):
         """
-        Store experience in replay buffer.
+        Store experience in replay buffer with privileged information.
         
         Args:
             observations: Current observations for all agents
@@ -334,15 +334,21 @@ class MADDPG_Agent:
             rewards: Rewards received by all agents
             next_observations: Next observations for all agents
             dones: Episode termination flags
-            info: Optional additional information
+            info: Optional additional information including privileged data
         """
+        # 提取特权信息（如果存在）
+        privileged_info = None
+        if info is not None and 'interference_matrix' in info:
+            privileged_info = info['interference_matrix']
+        
         experience = Experience(
             observations=observations,
             actions=actions,
             rewards=rewards,
             next_observations=next_observations,
             dones=dones,
-            info=info
+            info=info,
+            privileged_info=privileged_info  # 添加特权信息
         )
         self.replay_buffer.add(experience)
 
@@ -360,6 +366,7 @@ class MADDPG_Agent:
         self.training_steps += 1
         metrics = {}
         
+        # Sample batch from replay buffer
         # Sample batch from replay buffer
         if hasattr(self.replay_buffer, 'sample'):
             experiences, is_weights, indices = self.replay_buffer.sample(self.batch_size)
@@ -466,11 +473,16 @@ class MADDPG_Agent:
             current_q = self.critics[i](agent_obs, actions_flat).squeeze()
             
             # Calculate TD-error for PER
+        # Calculate TD-error for PER
             td_error = y - current_q
-            td_errors.append(td_error.detach().cpu().numpy())
             
-            # Calculate critic loss with importance sampling weights
-            critic_loss = (is_weights * (td_error ** 2)).mean()
+            # 添加TD误差裁剪以防止异常值主导训练
+            td_error_clipped = td_error.clamp(-1.0, 1.0)
+            
+            td_errors.append(td_error_clipped.detach().cpu().numpy())
+            
+            # Calculate critic loss with importance sampling weights (使用裁剪后的TD误差)
+            critic_loss = (is_weights * (td_error_clipped ** 2)).mean()
             critic_losses.append(critic_loss.item())
             
             # Update critic with gradient clipping
@@ -483,6 +495,8 @@ class MADDPG_Agent:
         # Update priorities in replay buffer
         if hasattr(self.replay_buffer, 'update_priorities'):
             max_td_errors = np.abs(np.max(td_errors, axis=0))
+            # 额外裁剪以防止优先级爆炸
+            max_td_errors = np.clip(max_td_errors, 0, 10.0)
             self.replay_buffer.update_priorities(indices, max_td_errors)
         
         # Update actors with gradient clipping

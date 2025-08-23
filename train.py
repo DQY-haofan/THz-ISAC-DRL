@@ -345,10 +345,10 @@ class LEOISACTrainer:
         return agent
     
     def _initialize_logging(self) -> Dict:
-        """Initialize logging infrastructure."""
+        """Initialize logging infrastructure with consistent filenames."""
         logger = {
-            'csv_path': self.experiment_dir / 'logs' / 'training_log.csv',
-            'eval_csv_path': self.experiment_dir / 'logs' / 'evaluation_log.csv'
+            'csv_path': self.experiment_dir / 'logs' / 'training.csv',  # 改为 training.csv
+            'eval_csv_path': self.experiment_dir / 'logs' / 'evaluation.csv'  # 改为 evaluation.csv
         }
         
         # Initialize TensorBoard if available
@@ -357,12 +357,14 @@ class LEOISACTrainer:
                 log_dir=self.experiment_dir / 'tensorboard'
             )
         
-        # Initialize CSV headers
+        # Initialize CSV headers - 确保标头与 run_smoke_test.py 期望的一致
         with open(logger['csv_path'], 'w') as f:
-            f.write("episode,step,reward,comm_utility,sens_utility,throughput,gdop\n")
+            # 使用正确的标头名称
+            f.write("episode,step,total_reward,comm_reward,sens_reward,throughput_gbps,gdop_m,sinr_db,loss_actor,loss_critic\n")
         
         with open(logger['eval_csv_path'], 'w') as f:
-            f.write("episode,algorithm,total_reward,throughput,gdop,sinr,convergence_time\n")
+            # 评估CSV的标头
+            f.write("episode,algorithm,total_reward,throughput_gbps,gdop_m,sinr_db,convergence_time\n")
         
         return logger
     
@@ -883,43 +885,52 @@ class LEOISACTrainer:
         """
         Convert environment state to NetworkState for SCA solver.
         
-        This provides the "perfect information" that SCA assumes.
+        This provides the true high-fidelity channel state information
+        from the physics engine to the centralized SCA benchmark.
         
         Args:
             env: Environment instance
             
         Returns:
-            NetworkState for SCA solver
+            NetworkState for SCA solver with true channel gains
         """
-        # Extract network information from environment
-        direct_channels = {}
-        interference_channels = {}
-        active_links = list(env.link_states.keys())
+        # Get true channel gains from physics interface
+        physics_interface = env.physical_layer_interface
+        
+        # Get direct channel gains
+        direct_channels = physics_interface.get_all_direct_channel_gains()
+        
+        # Get interference channel gains
+        interference_channels = physics_interface.get_all_interference_channel_gains()
+        
+        # Extract active links and satellites
+        active_links = [lid for lid, metrics in env.link_states.items() 
+                    if metrics.get('active', False)]
         satellites = env.agent_ids
+        
+        # Build link mapping
         link_mapping = {}
+        for link_id in active_links:
+            if link_id in env.link_registry:
+                link_mapping[link_id] = env.link_registry[link_id]
         
-        # Simplified channel extraction
-        for link_id, link_state in env.link_states.items():
-            if link_state['active']:
-                # Direct channel (simplified)
-                direct_channels[link_id] = complex(1e-6, 0)  # Placeholder
-                link_mapping[link_id] = (link_state['tx'], link_state['rx'])
-                
-                # Interference channels
-                for other_link_id, other_state in env.link_states.items():
-                    if other_link_id != link_id and other_state['active']:
-                        interference_channels[(other_link_id, link_id)] = complex(1e-8, 0)
-        
-        # Constraints
+        # Set power and bandwidth budgets
         power_budgets = {sat: env.max_tx_power_w for sat in satellites}
         bandwidth_budgets = {sat: env.bandwidth_hz for sat in satellites}
         per_link_power_max = {link: env.max_tx_power_w / 2 for link in active_links}
         
-        # QoS
-        min_sinr = {link: 10.0 for link in active_links[:2]}  # Some links have QoS
+        # Set QoS requirements (example: first 2 links have min SINR requirements)
+        min_sinr = {}
+        for i, link in enumerate(active_links[:2]):
+            min_sinr[link] = 10.0  # 10 dB minimum SINR
         
-        # Weights
+        # Set weights
         link_weights = {link: 1.0 for link in active_links}
+        
+        # Get system parameters from environment
+        noise_power = env.noise_power if hasattr(env, 'noise_power') else 1e-10
+        frequency_hz = env.frequency_hz if hasattr(env, 'frequency_hz') else 300e9
+        bandwidth_hz = env.bandwidth_hz if hasattr(env, 'bandwidth_hz') else 10e9
         
         return NetworkState(
             direct_channels=direct_channels,
@@ -927,18 +938,18 @@ class LEOISACTrainer:
             active_links=active_links,
             satellites=satellites,
             link_mapping=link_mapping,
-            noise_power=env.noise_power,
-            frequency_hz=env.frequency_hz,
-            bandwidth_hz=env.bandwidth_hz,
+            noise_power=noise_power,
+            frequency_hz=frequency_hz,
+            bandwidth_hz=bandwidth_hz,
             power_budgets=power_budgets,
             bandwidth_budgets=bandwidth_budgets,
             per_link_power_max=per_link_power_max,
-            hpa_saturation_power=15.0,
-            hpa_smoothness=3.0,
+            hpa_saturation_power=15.0,  # 15W saturation power
+            hpa_smoothness=3.0,  # Rapp model parameter
             min_sinr=min_sinr,
             max_sensing_distortion=100.0,
             link_weights=link_weights,
-            sensing_weight=env.isac_config.w_sens
+            sensing_weight=env.isac_config.w_sens if hasattr(env, 'isac_config') else 0.1
         )
     
     def _print_evaluation_comparison(self, results: Dict):
@@ -979,19 +990,43 @@ class LEOISACTrainer:
         )
     
     def _log_training(self, episode: int, reward: float, metrics: Dict):
-        """Log training metrics."""
-        # CSV logging
+        """Log training metrics with consistent column names."""
+        # CSV logging with correct column names
         with open(self.logger['csv_path'], 'a') as f:
+            # 提取各个奖励组件（如果有的话）
+            comm_reward = metrics.get('comm_reward', 0)
+            sens_reward = metrics.get('sens_reward', 0) 
+            throughput = metrics.get('throughput', 0)
+            gdop = metrics.get('gdop', np.inf)
+            sinr_db = metrics.get('sinr_db', 0)
+            loss_actor = metrics.get('learn_actor_loss_mean', 0)
+            loss_critic = metrics.get('learn_critic_loss_mean', 0)
+            
             f.write(f"{episode},{self.env.episode_step},{reward:.4f},"
-                   f"{metrics.get('throughput', 0):.4f},"
-                   f"{metrics.get('gdop', np.inf):.4f}\n")
+                f"{comm_reward:.4f},{sens_reward:.4f},"
+                f"{throughput:.4f},{gdop:.4f},{sinr_db:.4f},"
+                f"{loss_actor:.4f},{loss_critic:.4f}\n")
+        
+        # 同时更新 train_csv logger
+        self.train_csv.log({
+            'episode': episode,
+            'step': self.env.episode_step,
+            'total_reward': reward,
+            'comm_reward': comm_reward,
+            'sens_reward': sens_reward,
+            'throughput_gbps': throughput,
+            'gdop_m': gdop,
+            'sinr_db': sinr_db,
+            'loss_actor': loss_actor,
+            'loss_critic': loss_critic
+        })
         
         # TensorBoard logging
         if self.config.use_tensorboard and 'tensorboard' in self.logger:
             writer = self.logger['tensorboard']
             writer.add_scalar('Training/Reward', reward, episode)
-            writer.add_scalar('Training/Throughput', metrics.get('throughput', 0), episode)
-            writer.add_scalar('Training/GDOP', metrics.get('gdop', np.inf), episode)
+            writer.add_scalar('Training/Throughput', throughput, episode)
+            writer.add_scalar('Training/GDOP', gdop, episode)
             writer.add_scalar('Training/NoiseLevel', self.current_noise, episode)
             
             # Learning metrics
@@ -1000,13 +1035,27 @@ class LEOISACTrainer:
                     writer.add_scalar(f'Learning/{key[6:]}', value, episode)
     
     def _log_evaluation(self, episode: int, results: Dict):
-        """Log evaluation results."""
-        # CSV logging
+        """Log evaluation results with consistent column names."""
+        # CSV logging with correct column names
         with open(self.logger['eval_csv_path'], 'a') as f:
             for name, metrics in results.items():
                 f.write(f"{episode},{name},{metrics.get('total_reward', 0):.4f},"
-                       f"{metrics.get('throughput', 0):.4f},"
-                       f"{metrics.get('gdop', np.inf):.4f}\n")
+                    f"{metrics.get('throughput', 0):.4f},"
+                    f"{metrics.get('gdop', np.inf):.4f},"
+                    f"{metrics.get('sinr_db', 0):.4f},"
+                    f"{metrics.get('convergence_time', 0):.4f}\n")
+        
+        # 同时更新 eval_csv logger
+        for name, metrics in results.items():
+            self.eval_csv.log({
+                'episode': episode,
+                'algorithm': name,
+                'total_reward': metrics.get('total_reward', 0),
+                'throughput_gbps': metrics.get('throughput', 0),
+                'gdop_m': metrics.get('gdop', np.inf),
+                'sinr_db': metrics.get('sinr_db', 0),
+                'convergence_time': metrics.get('convergence_time', 0)
+            })
         
         # TensorBoard logging
         if self.config.use_tensorboard and 'tensorboard' in self.logger:
@@ -1155,19 +1204,27 @@ class CSVLogger:
 
 
 def main():
-    """Main entry point."""
+    """Main entry point with reproducibility setup."""
+    # Parse arguments first
     args = parse_arguments()
     
+    # 立即设置随机种子以确保可重现性 - 这是关键添加
+    setup_reproducibility(args.seed)
+    
     # Load configuration
-    if args.config:
+    if args.config and Path(args.config).exists():
         config = ExperimentConfig.from_yaml(args.config)
+        print(f"✓ Loaded configuration from {args.config}")
     else:
         config = ExperimentConfig.from_args(args)
+        print("✓ Using command-line configuration")
     
     # Create and run trainer
+    print(f"✓ Starting experiment with seed={args.seed}")
     trainer = LEOISACTrainer(config, args)
     trainer.train()
-
+    
+    print("\n✓ Experiment completed successfully!")
 
 if __name__ == "__main__":
     main()

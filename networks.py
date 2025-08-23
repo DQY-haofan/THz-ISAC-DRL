@@ -239,39 +239,47 @@ class ActorNetworkMLP(nn.Module):
                 neighbor_obs: Optional[torch.Tensor] = None,
                 neighbor_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Generate actions from observations (no hidden state needed).
-        
-        Args:
-            obs: Agent's observation (batch_size, obs_dim)
-            neighbor_obs: Neighbors' observations (batch_size, num_neighbors, neighbor_dim)
-            neighbor_mask: Valid neighbor mask (batch_size, num_neighbors)
-            
-        Returns:
-            Actions satisfying constraints (batch_size, action_dim)
+        Forward pass with device alignment for projection layer.
         """
-        batch_size = obs.size(0)
+        # Apply cyclical encoding if configured
+        if self.cyclical_encoder is not None:
+            obs = self.cyclical_encoder(obs)
         
-        # Process neighbor information if available
-        if neighbor_obs is not None and neighbor_obs.size(1) > 0:
-            # Use first neighbor's features as node features for attention
-            node_feat_for_gat = neighbor_obs[:, 0, :]
-            neighbor_context = self.gat(node_feat_for_gat, neighbor_obs, neighbor_mask)
-        else:
-            # No neighbors, create zero context
-            neighbor_context = torch.zeros(
-                batch_size, 
-                self.gat.num_heads * self.gat.out_features,
-                device=obs.device  # Ensure same device
+        if self.use_gru:
+            belief_state, self.hidden_state = self.encoder(
+                node_obs=obs,
+                neighbor_obs=neighbor_obs,
+                hidden_state=self.hidden_state,
+                neighbor_mask=neighbor_mask
             )
-        
-        # Concatenate observation with neighbor context
-        combined_features = torch.cat([obs, neighbor_context], dim=-1)
+            features = belief_state
+        else:
+            if neighbor_obs is not None and neighbor_obs.size(1) > 0:
+                node_feat = neighbor_obs[:, 0, :]
+                neighbor_context = self.gat(node_feat, neighbor_obs, neighbor_mask)
+            else:
+                neighbor_context = torch.zeros(
+                    obs.size(0),
+                    self.gat.num_heads * self.gat.out_features,
+                    device=obs.device
+                )
+            features = torch.cat([obs, neighbor_context], dim=-1)
         
         # Generate raw actions through MLP
-        raw_actions = self.mlp(combined_features)
+        raw_actions = self.mlp(features)
         
-        # Apply projection for constraint satisfaction
-        safe_actions = self.projection(raw_actions)
+        # Apply projection based on gradient mode
+        if torch.is_grad_enabled():
+            try:
+                safe_actions = self.projection(raw_actions)
+            except Exception as e:
+                warnings.warn(f"CvxpyLayer failed: {e}, using numpy projection")
+                safe_actions = self._project_numpy(raw_actions)
+        else:
+            safe_actions = self._project_numpy(raw_actions)
+        
+        # 确保输出张量与输入在同一设备上
+        safe_actions = safe_actions.to(raw_actions.device)
         
         return safe_actions
 class GATGRUEncoder(nn.Module):
@@ -691,21 +699,12 @@ class CriticNetwork(nn.Module):
                  hidden_dims: List[int] = [512, 256, 128],
                  gat_hidden: int = 64, gat_heads: int = 4,
                  gru_hidden: int = 128,
+                 privileged_dim: int = 0,  # 新增：特权信息维度
                  share_encoder: bool = True,
                  actor_encoder: Optional[GATGRUEncoder] = None):
         """
         Args:
-            num_agents: Number of agents in the system
-            obs_dim: Dimension of each agent's observation
-            action_dim: Dimension of each agent's action
-            num_neighbors: Maximum neighbors per agent
-            neighbor_dim: Dimension of neighbor features
-            hidden_dims: Hidden layer dimensions for value MLP
-            gat_hidden: GAT hidden dimension
-            gat_heads: Number of GAT attention heads
-            gru_hidden: GRU hidden dimension
-            share_encoder: Whether to share encoder with actor
-            actor_encoder: Pre-trained encoder from actor (if sharing)
+            privileged_dim: Dimension of privileged information (e.g., flattened interference matrix)
         """
         super(CriticNetwork, self).__init__()
         
@@ -713,16 +712,15 @@ class CriticNetwork(nn.Module):
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.gru_hidden = gru_hidden
+        self.privileged_dim = privileged_dim
         
         # Create or share encoders for each agent
         self.encoders = nn.ModuleList()
         
         for i in range(num_agents):
             if share_encoder and actor_encoder is not None:
-                # Share encoder parameters with actor
                 self.encoders.append(actor_encoder)
             else:
-                # Create independent encoder
                 encoder = GATGRUEncoder(
                     node_features=obs_dim,
                     neighbor_features=neighbor_dim,
@@ -733,8 +731,8 @@ class CriticNetwork(nn.Module):
                 self.encoders.append(encoder)
         
         # MLP for Q-value estimation
-        # Input: concatenated belief states + all actions
-        input_dim = num_agents * (gru_hidden + action_dim)
+        # 输入：拼接的信念状态 + 所有动作 + 特权信息
+        input_dim = num_agents * (gru_hidden + action_dim) + privileged_dim
         
         layers = []
         for hidden_dim in hidden_dims:
@@ -744,12 +742,10 @@ class CriticNetwork(nn.Module):
             layers.append(nn.Dropout(0.1))
             input_dim = hidden_dim
         
-        # Output single Q-value
         layers.append(nn.Linear(input_dim, 1))
         
         self.value_mlp = nn.Sequential(*layers)
         
-        # Dictionary to store hidden states with batch size as key
         self.hidden_states_cache = {}
         self.current_batch_size = None
         
@@ -779,36 +775,24 @@ class CriticNetwork(nn.Module):
     
     def forward(self, observations: List[torch.Tensor],
                 actions: torch.Tensor,
+                privileged_info: Optional[torch.Tensor] = None,  # 新增参数
                 neighbor_observations: Optional[List[torch.Tensor]] = None,
                 neighbor_masks: Optional[List[torch.Tensor]] = None) -> torch.Tensor:
         """
-        Compute Q-value for joint observation-action pair with dynamic batch handling.
-        
-        Args:
-            observations: List of observations for each agent
-            actions: Joint actions (batch_size, num_agents * action_dim)
-            neighbor_observations: List of neighbor observations for each agent
-            neighbor_masks: List of neighbor masks for each agent
-            
-        Returns:
-            Q-value (batch_size, 1)
+        Compute Q-value with privileged information.
         """
-        # Determine batch size from first observation
         batch_size = observations[0].size(0)
         device = observations[0].device
         
         belief_states = []
         
-        # Process each agent's observation through its encoder
         for i in range(self.num_agents):
             obs = observations[i]
             neighbor_obs = neighbor_observations[i] if neighbor_observations else None
             neighbor_mask = neighbor_masks[i] if neighbor_masks else None
             
-            # Get or create hidden state with correct batch size
             hidden_state = self._get_or_create_hidden_state(i, batch_size, device)
             
-            # Process through encoder
             belief_state, new_hidden = self.encoders[i](
                 node_obs=obs,
                 neighbor_obs=neighbor_obs,
@@ -816,15 +800,18 @@ class CriticNetwork(nn.Module):
                 neighbor_mask=neighbor_mask
             )
             
-            # Update cached hidden state
             self.hidden_states_cache[(i, batch_size)] = new_hidden.detach()
-            
             belief_states.append(belief_state)
         
-        # Concatenate all belief states and actions
-        global_state = torch.cat(belief_states + [actions], dim=-1)
+        # 拼接所有信念状态和动作
+        features_to_concat = belief_states + [actions]
         
-        # Compute Q-value
+        # 添加特权信息（如果提供）
+        if privileged_info is not None and self.privileged_dim > 0:
+            features_to_concat.append(privileged_info)
+        
+        global_state = torch.cat(features_to_concat, dim=-1)
+        
         q_value = self.value_mlp(global_state)
         
         return q_value

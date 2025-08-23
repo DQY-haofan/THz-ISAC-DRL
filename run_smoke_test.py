@@ -253,19 +253,21 @@ def analyze_results():
     return success
 
 def main():
-    """Main smoke test execution."""
+    """Main smoke test execution with fixed config handling."""
     print("LEO-ISAC MARL System - Smoke Test")
     print("=" * 60)
     
-
-    
-    # Check if test config exists
+    # Check if test config exists - 修复的部分
     if not Path("test_config.yml").exists():
-        print("Creating test_config.yml...")
-        # Write the config file if it doesn't exist
-        with open("test_config.yml", "w") as f:
-            f.write(TEST_CONFIG_CONTENT)  # Would need to define this
-        print("test_config.yml created")
+        print("\n" + "=" * 60)
+        print("ERROR: test_config.yml not found!")
+        print("=" * 60)
+        print("\nPlease ensure test_config.yml is present in the root directory.")
+        print("This file defines the simplified configuration for smoke testing.")
+        print("\nExpected location: ./test_config.yml")
+        return 1
+    
+    print("✓ Found test_config.yml")
     
     # Run training
     if not run_training():
@@ -284,6 +286,6 @@ def main():
     print("You can now proceed with full-scale experiments.")
     
     return 0
-
+    
 if __name__ == "__main__":
     exit(main())

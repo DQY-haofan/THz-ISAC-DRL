@@ -66,11 +66,6 @@ class PhysicalLayerInterface:
                  isac_config: Any):
         """
         Initialize the physical layer interface with static configuration.
-        
-        Args:
-            constellation_config: Constellation parameters (n_satellites, altitude, etc.)
-            hardware_config: Hardware specifications (frequency, bandwidth, power, etc.)
-            isac_config: ISAC parameters (reward weights, sensing modes, etc.)
         """
         # Store configurations
         self.const_config = constellation_config
@@ -108,6 +103,14 @@ class PhysicalLayerInterface:
             n_satellites=constellation_config.n_satellites
         )
         
+        # 添加递归信息矩阵和向量作为持久状态变量
+        n_states = self.info_filter.n_states_total
+        self.info_matrix_J = np.eye(n_states) * 1e-6  # 小的初始先验
+        self.info_vector_y = np.zeros((n_states, 1))
+        
+        # 添加时间跟踪
+        self.last_update_time = 0.0
+        
         # Cache for computed results
         self._cache = {}
         self._cache_valid = False
@@ -124,6 +127,15 @@ class PhysicalLayerInterface:
         self.network_fim = None
         self.efim = None
         
+    def reset(self):
+        """
+        重置递归FIM状态（由环境的reset方法调用）。
+        """
+        n_states = self.info_filter.n_states_total
+        self.info_matrix_J = np.eye(n_states) * 1e-6
+        self.info_vector_y = np.zeros((n_states, 1))
+        self.last_update_time = 0.0
+
     def update_dynamic_state(self,
                             current_time: float,
                             satellite_states: np.ndarray,
@@ -132,17 +144,7 @@ class PhysicalLayerInterface:
         """
         Update the interface with current dynamic network state.
         
-        This method should be called at the beginning of each time step to
-        inject current network state. It triggers all necessary computations
-        and caches results for subsequent queries.
-        
-        Args:
-            current_time: Current simulation time (seconds)
-            satellite_states: Complete state matrix (8N_v x 1) with positions, 
-                            velocities, clock biases and drifts
-            active_links: Set of currently active ISL links as (tx_id, rx_id) tuples
-            power_allocations: Power allocation per agent and link
-                              {agent_id: {link_id: power_w}}
+        在测量更新之前执行时间更新（预测）步骤。
         """
         # Invalidate cache when state changes
         self._cache_valid = False
@@ -153,6 +155,23 @@ class PhysicalLayerInterface:
         self.satellite_states = satellite_states
         self.active_links = active_links
         self.power_allocations = power_allocations
+        
+        # 执行时间更新（预测）如果时间已经推进
+        if current_time > self.last_update_time:
+            dt = current_time - self.last_update_time
+            
+            # 创建状态转移矩阵和过程噪声协方差
+            from fim import create_state_transition_matrix, create_process_noise_covariance, predict_info
+            
+            F = create_state_transition_matrix(dt, self.const_config.n_satellites)
+            Q = create_process_noise_covariance(dt, self.const_config.n_satellites)
+            
+            # 执行信息预测
+            self.info_matrix_J, self.info_vector_y = predict_info(
+                self.info_matrix_J, self.info_vector_y, F, Q
+            )
+            
+            self.last_update_time = current_time
         
         # Trigger comprehensive physical layer computation
         self._compute_all_metrics()
@@ -503,46 +522,204 @@ class PhysicalLayerInterface:
             }
     
     def _compute_interference_matrix(self):
-        """Compute interference coefficients between all link pairs."""
+        """
+        Compute the interference matrix using high-fidelity physics-based model.
         
-        link_ids = list(self.link_metrics.keys())
+        This implements the geometric-stochastic interference model from interference.py,
+        incorporating path loss, antenna patterns, and pointing errors.
+        """
+        import numpy as np
+        from interference import LinkParameters, calculate_alpha_lm
         
-        for victim_id in link_ids:
-            for interferer_id in link_ids:
+        # Initialize interference matrix
+        n_links = len(self.link_registry)
+        self.interference_matrix = np.zeros((n_links, n_links))
+        
+        # Get link IDs for indexing
+        link_ids = list(self.link_registry.keys())
+        link_id_to_idx = {lid: idx for idx, lid in enumerate(link_ids)}
+        
+        # Iterate over all link pairs
+        for victim_idx, victim_id in enumerate(link_ids):
+            for interferer_idx, interferer_id in enumerate(link_ids):
+                if victim_id == interferer_id:
+                    continue  # No self-interference
+                
+                # Get transmitter and receiver for each link
+                victim_tx, victim_rx = self.link_registry[victim_id]
+                interferer_tx, interferer_rx = self.link_registry[interferer_id]
+                
+                # Get link metrics
+                victim_metrics = self.link_metrics.get(victim_id, {})
+                interferer_metrics = self.link_metrics.get(interferer_id, {})
+                
+                # Skip if metrics not available
+                if not victim_metrics or not interferer_metrics:
+                    continue
+                
+                # Extract positions from satellite states
+                victim_tx_pos = self.satellite_states[victim_tx]['position']
+                victim_rx_pos = self.satellite_states[victim_rx]['position']
+                interferer_tx_pos = self.satellite_states[interferer_tx]['position']
+                
+                # Calculate distances (in meters)
+                victim_distance = np.linalg.norm(victim_rx_pos - victim_tx_pos)
+                interferer_to_victim_distance = np.linalg.norm(victim_rx_pos - interferer_tx_pos)
+                
+                # Calculate angular separation (theta_lm)
+                # This is the angle between the interferer's beam and the victim receiver
+                interferer_beam_dir = (interferer_rx_pos - interferer_tx_pos) / \
+                                    np.linalg.norm(interferer_rx_pos - interferer_tx_pos)
+                interferer_to_victim_dir = (victim_rx_pos - interferer_tx_pos) / \
+                                        interferer_to_victim_distance
+                
+                # Angular separation in radians
+                cos_theta = np.clip(np.dot(interferer_beam_dir, interferer_to_victim_dir), -1, 1)
+                theta_lm = np.arccos(cos_theta)
+                
+                # Create LinkParameters for target link
+                target_link = LinkParameters(
+                    power=victim_metrics.get('tx_power', self.default_tx_power),
+                    gain_tx=victim_metrics.get('gain_tx', self.default_antenna_gain),
+                    gain_rx=victim_metrics.get('gain_rx', self.default_antenna_gain),
+                    beamwidth=victim_metrics.get('beamwidth', self.default_beamwidth),
+                    sigma_e=victim_metrics.get('pointing_error', self.default_pointing_error),
+                    distance=victim_distance
+                )
+                
+                # Create LinkParameters for interfering transmitter
+                interferer_link = LinkParameters(
+                    power=interferer_metrics.get('tx_power', self.default_tx_power),
+                    gain_tx=interferer_metrics.get('gain_tx', self.default_antenna_gain),
+                    gain_rx=interferer_metrics.get('gain_rx', self.default_antenna_gain),
+                    beamwidth=interferer_metrics.get('beamwidth', self.default_beamwidth),
+                    sigma_e=interferer_metrics.get('pointing_error', self.default_pointing_error),
+                    distance=np.linalg.norm(interferer_rx_pos - interferer_tx_pos)
+                )
+                
+                # Calculate interference coefficient using physics-based model
+                alpha_lm = calculate_alpha_lm(
+                    target_link=target_link,
+                    interferer_tx=interferer_link,
+                    distance_lm=interferer_to_victim_distance,
+                    theta_lm=theta_lm
+                )
+                
+                # Store in interference matrix
+                self.interference_matrix[victim_idx, interferer_idx] = alpha_lm
+    
+        return self.interference_matrix
+    
+
+    def get_all_direct_channel_gains(self) -> Dict[str, complex]:
+        """
+        Get all direct channel gains for active links.
+        
+        Returns:
+            Dictionary mapping link_id to complex channel gain h_ℓ
+        """
+        import numpy as np
+        from hardware import calculate_channel_gain, calculate_antenna_gain, calculate_beamwidth
+        
+        direct_channels = {}
+        
+        for link_id, (tx_id, rx_id) in self.link_registry.items():
+            # Get link metrics
+            metrics = self.link_metrics.get(link_id, {})
+            if not metrics.get('active', False):
+                continue
+                
+            # Get positions
+            tx_pos = self.satellite_states[tx_id]['position']
+            rx_pos = self.satellite_states[rx_id]['position']
+            distance = np.linalg.norm(rx_pos - tx_pos)
+            
+            # Calculate antenna parameters
+            G_T = metrics.get('gain_tx', calculate_antenna_gain(
+                self.frequency_hz, self.antenna_diameter))
+            G_R = metrics.get('gain_rx', G_T)
+            theta_B = calculate_beamwidth(self.frequency_hz, self.antenna_diameter)
+            sigma_e = metrics.get('pointing_error', self.default_pointing_error)
+            
+            # Calculate channel gain magnitude
+            channel_gain_magnitude = calculate_channel_gain(
+                d=distance,
+                f_c=self.frequency_hz,
+                G_T=G_T,
+                G_R=G_R,
+                sigma_e=sigma_e,
+                theta_B=theta_B
+            )
+            
+            # Add random phase (uniform distribution)
+            phase = np.random.uniform(0, 2*np.pi)
+            direct_channels[link_id] = np.sqrt(channel_gain_magnitude) * np.exp(1j * phase)
+        
+        return direct_channels
+
+
+    def get_all_interference_channel_gains(self) -> Dict[Tuple[str, str], complex]:
+        """
+        Get all interference channel gains between links.
+        
+        Returns:
+            Dictionary mapping (interferer_link_id, victim_link_id) to complex channel gain g_ℓ',ℓ
+        """
+        import numpy as np
+        from hardware import calculate_channel_gain, calculate_antenna_gain, calculate_beamwidth
+        
+        interference_channels = {}
+        
+        # Ensure interference matrix is computed
+        if self.interference_matrix is None:
+            self._compute_interference_matrix()
+        
+        link_ids = list(self.link_registry.keys())
+        
+        for victim_idx, victim_id in enumerate(link_ids):
+            for interferer_idx, interferer_id in enumerate(link_ids):
                 if victim_id == interferer_id:
                     continue
                     
-                victim = self.link_metrics[victim_id]
-                interferer = self.link_metrics[interferer_id]
+                # Get interference coefficient
+                alpha_lm = self.interference_matrix[victim_idx, interferer_idx]
                 
-                # Skip if same receiver (no self-interference)
-                if victim['rx_id'] == interferer['rx_id']:
-                    continue
+                if alpha_lm > 0:
+                    # Get link information
+                    victim_tx, victim_rx = self.link_registry[victim_id]
+                    interferer_tx, _ = self.link_registry[interferer_id]
                     
-                # Get positions for interference path
-                int_tx_idx = self._get_satellite_index(interferer['tx_id'])
-                vic_rx_idx = self._get_satellite_index(victim['rx_id'])
-                
-                int_tx_pos = self.satellite_states[int_tx_idx*8:int_tx_idx*8+3]
-                vic_rx_pos = self.satellite_states[vic_rx_idx*8:vic_rx_idx*8+3]
-                
-                # Calculate interference path distance
-                int_distance = np.linalg.norm(vic_rx_pos - int_tx_pos)
-                
-                # Simplified interference coefficient (homogeneous network)
-                # α_ℓm = (d_ℓ/d_ℓm)² * angular_attenuation
-                path_loss_ratio = (victim['distance'] / int_distance)**2
-                
-                # Simplified angular attenuation (assuming some angular separation)
-                angular_atten = 0.01  # -20 dB nominal
-                
-                alpha_lm = path_loss_ratio * angular_atten
-                
-                self.interference_matrix[(victim_id, interferer_id)] = alpha_lm
-    
+                    # Get positions
+                    victim_rx_pos = self.satellite_states[victim_rx]['position']
+                    interferer_tx_pos = self.satellite_states[interferer_tx]['position']
+                    distance = np.linalg.norm(victim_rx_pos - interferer_tx_pos)
+                    
+                    # Calculate interference channel gain from alpha_lm
+                    # Since alpha_lm = |g_lm|^2 / |h_l|^2 * (other factors)
+                    # We approximate the interference channel gain
+                    victim_metrics = self.link_metrics.get(victim_id, {})
+                    path_loss = (self.wavelength / (4 * np.pi * distance))**2
+                    
+                    # Get antenna gains
+                    G_T = victim_metrics.get('gain_tx', self.default_antenna_gain)
+                    G_R = victim_metrics.get('gain_rx', self.default_antenna_gain)
+                    
+                    # Compute interference channel gain magnitude
+                    interference_gain_magnitude = alpha_lm * path_loss * G_T * G_R
+                    
+                    # Add random phase
+                    phase = np.random.uniform(0, 2*np.pi)
+                    interference_channels[(interferer_id, victim_id)] = \
+                        np.sqrt(interference_gain_magnitude) * np.exp(1j * phase)
+        
+        return interference_channels
+
+
     def _update_metrics_with_interference(self):
         """Update link metrics with interference and compute effective SINR."""
         
+        from performance_model import calculate_effective_sinr, calculate_range_variance_m2
+
         for link_id, metrics in self.link_metrics.items():
             # Sum interference from all other links
             total_interference = 0.0
@@ -573,10 +750,11 @@ class PhysicalLayerInterface:
             
             # Calculate range variance
             if sinr_eff > 0:
-                range_var = calculate_range_variance(
-                    sinr_eff,
-                    self.hw_profile.sigma_phi_squared,
-                    self.frequency_hz,
+# 修正函数调用 - 使用正确的函数名
+                range_var = calculate_range_variance_m2(
+                    sinr_eff=sinr_eff,
+                    sigma_phi_squared=sigma_phi_squared,
+                    f_c=self.frequency_hz,
                     bandwidth=self.bandwidth_hz
                 )
             else:
@@ -588,14 +766,15 @@ class PhysicalLayerInterface:
             metrics['range_variance'] = range_var
     
     def _update_network_fim(self):
-        """Update the network Fisher Information Matrix."""
-        
-        n_states = self.info_filter.n_states_total
-        self.network_fim = np.zeros((n_states, n_states))
+        """
+        更新网络Fisher信息矩阵（仅执行测量更新/校正步骤）。
+        """
+        from fim import update_info, calculate_efim
         
         # Build list of active links with measurements
         active_link_pairs = []
         range_variances = []
+        measurements = []  # 实际测量值
         
         for link_id, metrics in self.link_metrics.items():
             if metrics['sinr_eff'] > 0 and metrics['range_variance'] < np.inf:
@@ -603,24 +782,25 @@ class PhysicalLayerInterface:
                 rx_idx = self._get_satellite_index(metrics['rx_id'])
                 active_link_pairs.append((tx_idx, rx_idx))
                 range_variances.append(metrics['range_variance'])
+                
+                # 添加模拟的TOA测量（实际系统中应该是真实测量）
+                measurements.append(metrics.get('toa_measurement', 0.0))
         
         if active_link_pairs:
-            # Use the FIM update function
-            # Note: update_info expects TOA variances in s², so we convert
-            dummy_prior = np.eye(n_states) * 1e-6  # Small prior information
-            dummy_y = np.zeros((n_states, 1))
-            dummy_z = [0.0] * len(active_link_pairs)
-            
-            self.network_fim, _ = update_info(
-                dummy_prior,
-                dummy_y,
+            # 执行测量更新（使用现有的info_matrix_J作为先验）
+            self.info_matrix_J, self.info_vector_y = update_info(
+                self.info_matrix_J,  # 使用递归的先验
+                self.info_vector_y,
                 active_link_pairs,
                 self.satellite_states,
-                range_variances,  # Will be converted internally
-                dummy_z
+                range_variances,  # 将在内部转换
+                measurements
             )
             
-            # Calculate EFIM
+            # 存储完整的网络FIM
+            self.network_fim = self.info_matrix_J.copy()
+            
+            # 计算EFIM
             try:
                 self.efim = calculate_efim(
                     self.network_fim,
