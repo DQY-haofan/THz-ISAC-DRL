@@ -315,38 +315,51 @@ class LEO_ISAC_Env:
     def _compute_rewards(self, actions: Dict) -> Dict[str, float]:
         """
         Compute ISAC rewards with theoretically consistent sensing reward.
+        
+        This function computes the weighted sum of communication and sensing rewards,
+        minus any penalty for constraint violations.
         """
         rewards = {}
-        r_penalty = 0.0
         
         for agent_id in self.agent_ids:
-            # 获取通信和感知效用
-            r_comm = self.phy_interface.get_total_comm_reward(agent_id)
-            r_sens = self._compute_sensing_reward_a_optimal(agent_id)
+            # Initialize all reward components first
+            r_comm = 0.0
+            r_sens = 0.0
+            r_penalty = 0.0  # Initialize penalty to 0 at the beginning
             
-            # --- CRITICAL FIX ---
-            # 必须在这里将 r_penalty 初始化为0。
-            # 这样即使下面的if条件不满足，该变量也始终存在。
-            r_penalty = 0.0
+            # Get communication reward
+            try:
+                r_comm = self.phy_interface.get_total_comm_reward(agent_id)
+            except Exception as e:
+                print(f"Warning: Failed to get comm reward for {agent_id}: {e}")
+                r_comm = 0.0
             
-            # 只有当智能体采取了有效动作时，才计算惩罚
+            # Get sensing reward
+            try:
+                r_sens = self._compute_sensing_reward_a_optimal(agent_id)
+            except Exception as e:
+                print(f"Warning: Failed to get sensing reward for {agent_id}: {e}")
+                r_sens = 0.0
+            
+            # Calculate penalty only if agent has valid actions
             if agent_id in actions and 'power_allocation' in actions[agent_id]:
                 power_alloc = actions[agent_id].get('power_allocation', {})
                 total_power = sum(power_alloc.values())
                 
-                # 这是一个额外的保障，主要约束应由Actor网络的可微投影层处理
+                # Apply penalty for power constraint violation
                 if total_power > self.max_tx_power_w:
-                    r_penalty = self.isac_config.w_penalty * (
-                        (total_power - self.max_tx_power_w) / self.max_tx_power_w
-                    )
+                    excess_ratio = (total_power - self.max_tx_power_w) / self.max_tx_power_w
+                    r_penalty = self.isac_config.w_penalty * excess_ratio
             
-            # 计算最终的加权和奖励
-            rewards[agent_id] = (
+            # Compute final weighted reward
+            total_reward = (
                 self.isac_config.w_comm * r_comm +
                 self.isac_config.w_sens * r_sens -
                 r_penalty
             )
-
+            
+            rewards[agent_id] = total_reward
+        
         return rewards
 # ===================== END: COPY THIS ENTIRE FUNCTION =====================
 
