@@ -751,7 +751,7 @@ class PhysicalLayerInterface:
 # 修正函数调用 - 使用正确的函数名
                 range_var = calculate_range_variance_m2(
                     sinr_eff=sinr_eff,
-                    sigma_phi_squared=sigma_phi_squared,
+                    sigma_phi_squared=self.hw_profile.sigma_phi_squared,
                     f_c=self.frequency_hz,
                     bandwidth=self.bandwidth_hz
                 )
