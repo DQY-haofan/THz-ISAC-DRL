@@ -311,6 +311,7 @@ class LEO_ISAC_Env:
             link_registry=self.link_registry # <-- 添加这一行
         )
     
+    # ==================== START: COPY THIS ENTIRE FUNCTION ====================
     def _compute_rewards(self, actions: Dict) -> Dict[str, float]:
         """
         Compute ISAC rewards with theoretically consistent sensing reward.
@@ -318,44 +319,35 @@ class LEO_ISAC_Env:
         rewards = {}
         
         for agent_id in self.agent_ids:
-            # Communication reward
+            # 获取通信和感知效用
             r_comm = self.phy_interface.get_total_comm_reward(agent_id)
-            
-            # Sensing reward
             r_sens = self._compute_sensing_reward_a_optimal(agent_id)
             
-            # --- START OF CORRECTION ---
-            #
-            # 在使用 r_penalty 之前，必须将其初始化为一个默认值。
+            # --- CRITICAL FIX ---
+            # 必须在这里将 r_penalty 初始化为0。
+            # 这样即使下面的if条件不满足，该变量也始终存在。
             r_penalty = 0.0
-            #
-            # --- END OF CORRECTION ---
             
             # 只有当智能体采取了有效动作时，才计算惩罚
             if agent_id in actions and 'power_allocation' in actions[agent_id]:
                 power_alloc = actions[agent_id].get('power_allocation', {})
                 total_power = sum(power_alloc.values())
                 
-                # 注意：这里的惩罚应该由可微投影层处理，但我们保留它作为双重保障
+                # 这是一个额外的保障，主要约束应由Actor网络的可微投影层处理
                 if total_power > self.max_tx_power_w:
                     r_penalty = self.isac_config.w_penalty * (
                         (total_power - self.max_tx_power_w) / self.max_tx_power_w
                     )
             
-            # Combined ISAC reward
+            # 计算最终的加权和奖励
             rewards[agent_id] = (
                 self.isac_config.w_comm * r_comm +
                 self.isac_config.w_sens * r_sens -
                 r_penalty
             )
-            
-            # (Debug print from previous step, can be kept or removed)
-            if os.getenv('VERBOSE_DEBUG') == '1' and self.episode_step < 5:
-                print(f"[DEBUG Env-RWD] Agt {agent_id}: R_comm={r_comm:.3f}, R_sens={r_sens:.3f}, "
-                      f"R_pen={r_penalty:.3f} -> Total={rewards[agent_id]:.3f}")
 
         return rewards
-    
+# ===================== END: COPY THIS ENTIRE FUNCTION =====================
 
     def _compute_sensing_reward_a_optimal(self, agent_id: str) -> float:
         """
