@@ -11,6 +11,7 @@ Integrates all modules: LEO_ISAC_Env, MADDPG_Agent, CentralizedSCASolver, and ba
 Author: THz ISAC Research Team
 Date: August 2025
 """
+from tqdm import tqdm
 
 import argparse
 import yaml
@@ -356,7 +357,7 @@ class LEOISACTrainer:
     
     def train(self):
         """
-        Main training loop.
+        Main training loop with progress bars.
         """
         print("=" * 70)
         print("Starting LEO-ISAC MARL Training")
@@ -365,12 +366,37 @@ class LEOISACTrainer:
         print(f"Agents: {self.env.n_agents}")
         print("=" * 70)
         
-        # Training loop
-        for episode in range(self.config.max_episodes):
+        # Create main progress bar for episodes
+        episode_pbar = tqdm(
+            range(self.config.max_episodes),
+            desc="Training Episodes",
+            unit="ep",
+            ncols=100,
+            position=0,
+            leave=True
+        )
+        
+        # Initialize metrics for progress bar display
+        best_reward = -float('inf')
+        recent_rewards = []
+        
+        for episode in episode_pbar:
             episode_start = time.time()
             
-            # Run training episode
+            # Run training episode with its own progress bar
             episode_reward, episode_metrics = self._run_training_episode(episode)
+            
+            # Track recent rewards for moving average
+            recent_rewards.append(episode_reward)
+            if len(recent_rewards) > 100:
+                recent_rewards.pop(0)
+            
+            # Update best reward
+            if episode_reward > best_reward:
+                best_reward = episode_reward
+            
+            # Calculate moving average
+            avg_reward = np.mean(recent_rewards[-10:]) if recent_rewards else 0
             
             # Update exploration noise
             self._update_exploration_noise()
@@ -378,21 +404,43 @@ class LEOISACTrainer:
             # Log training progress
             self._log_training(episode, episode_reward, episode_metrics)
             
+            # Update progress bar with key metrics
+            episode_pbar.set_postfix({
+                'Reward': f'{episode_reward:.2f}',
+                'Avg(10)': f'{avg_reward:.2f}',
+                'Best': f'{best_reward:.2f}',
+                'Throughput': f"{episode_metrics.get('throughput', 0):.1f}",
+                'Noise': f'{self.current_noise:.3f}'
+            })
+            
             # Periodic evaluation
             if (episode + 1) % self.config.eval_frequency == 0:
+                print(f"\n{'='*70}")
+                print(f"Evaluation at Episode {episode + 1}")
+                print(f"{'='*70}")
                 self._evaluate(episode)
+                print(f"{'='*70}\n")
             
             # Save models
             if (episode + 1) % self.config.save_frequency == 0:
                 self._save_models(episode)
+                if self.config.verbose:
+                    tqdm.write(f"✓ Models saved at episode {episode + 1}")
             
-            # Print progress
-            if self.config.verbose and episode % 10 == 0:
+            # Print detailed progress every 10 episodes
+            if self.config.verbose and episode % 10 == 0 and episode > 0:
                 episode_time = time.time() - episode_start
-                print(f"Episode {episode}/{self.config.max_episodes} | "
-                      f"Reward: {episode_reward:.2f} | "
-                      f"Throughput: {episode_metrics.get('throughput', 0):.2f} Gbps | "
-                      f"Time: {episode_time:.2f}s")
+                tqdm.write(
+                    f"Episode {episode}/{self.config.max_episodes} | "
+                    f"Reward: {episode_reward:.2f} | "
+                    f"Avg: {avg_reward:.2f} | "
+                    f"Throughput: {episode_metrics.get('throughput', 0):.2f} Gbps | "
+                    f"GDOP: {episode_metrics.get('gdop', np.inf):.1f} m | "
+                    f"Time: {episode_time:.2f}s"
+                )
+        
+        # Close progress bar
+        episode_pbar.close()
         
         # Final evaluation
         print("\n" + "=" * 70)
@@ -411,7 +459,7 @@ class LEOISACTrainer:
     
     def _run_training_episode(self, episode: int) -> Tuple[float, Dict]:
         """
-        Run a single training episode.
+        Run a single training episode with step-level progress bar.
         
         Args:
             episode: Episode number
@@ -430,7 +478,17 @@ class LEOISACTrainer:
         # Convert observations to list format for agent
         obs_list = [observations[agent_id] for agent_id in self.env.agent_ids]
         
-        for step in range(self.config.max_steps):
+        # Create progress bar for steps within episode
+        step_pbar = tqdm(
+            range(self.config.max_steps),
+            desc=f"  Episode {episode} Steps",
+            unit="step",
+            ncols=100,
+            position=1,
+            leave=False
+        )
+        
+        for step in step_pbar:
             # Select actions with exploration noise
             if episode < self.config.warmup_episodes:
                 # Random exploration during warmup
@@ -446,7 +504,7 @@ class LEOISACTrainer:
             # Convert actions to environment format
             action_dict = {}
             for i, agent_id in enumerate(self.env.agent_ids):
-                # Get active links for this agent (使用 link_registry 而不是 link_states)
+                # Get active links for this agent
                 agent_links = [
                     lid for lid, (tx, rx) in self.env.link_registry.items()
                     if tx == agent_id
@@ -490,16 +548,28 @@ class LEOISACTrainer:
                     episode_metrics[f'learn_{key}'].append(value)
             
             # Accumulate rewards and metrics
-            episode_reward += np.mean(rewards_array)
+            step_reward = np.mean(rewards_array)
+            episode_reward += step_reward
             episode_metrics['throughput'].append(info.get('total_throughput', 0))
             episode_metrics['gdop'].append(info.get('gdop', np.inf))
             episode_metrics['active_links'].append(info.get('n_active_links', 0))
+            
+            # Update step progress bar
+            step_pbar.set_postfix({
+                'R': f'{step_reward:.3f}',
+                'Total': f'{episode_reward:.2f}',
+                'Tput': f"{info.get('total_throughput', 0):.1f}",
+                'Links': info.get('n_active_links', 0)
+            })
             
             # Update observations
             obs_list = next_obs_list
             
             if done:
                 break
+        
+        # Close step progress bar
+        step_pbar.close()
         
         # Aggregate episode metrics
         aggregated_metrics = {}
@@ -514,7 +584,7 @@ class LEOISACTrainer:
     
     def _evaluate(self, episode: int, final: bool = False):
         """
-        Evaluate current policy against benchmarks.
+        Evaluate current policy against benchmarks with progress indication.
         
         Args:
             episode: Current training episode
@@ -525,23 +595,34 @@ class LEOISACTrainer:
         
         evaluation_results = {}
         
-        # Evaluate MADDPG agent
-        print("Evaluating MADDPG...")
-        maddpg_metrics = self._evaluate_agent(self.agent, "MADDPG")
-        evaluation_results['MADDPG'] = maddpg_metrics
-        
-        # Evaluate baselines
+        # Create progress bar for evaluation
+        eval_algorithms = ['MADDPG']
         if self.config.compare_baselines:
-            for name, baseline in self.baselines.items():
-                print(f"Evaluating {name} baseline...")
-                baseline_metrics = self._evaluate_baseline(baseline, name)
-                evaluation_results[name] = baseline_metrics
-        
-        # Evaluate centralized SCA (if enabled)
+            eval_algorithms.extend(['random', 'equal', 'greedy'])
         if self.config.benchmark_sca and self.sca_solver:
-            print("Evaluating Centralized SCA...")
-            sca_metrics = self._evaluate_sca()
-            evaluation_results['SCA'] = sca_metrics
+            eval_algorithms.append('SCA')
+        
+        eval_pbar = tqdm(
+            eval_algorithms,
+            desc="Evaluating algorithms",
+            unit="algo",
+            ncols=100
+        )
+        
+        for algo_name in eval_pbar:
+            eval_pbar.set_description(f"Evaluating {algo_name}")
+            
+            if algo_name == 'MADDPG':
+                metrics = self._evaluate_agent(self.agent, "MADDPG")
+                evaluation_results['MADDPG'] = metrics
+            elif algo_name in self.baselines:
+                metrics = self._evaluate_baseline(self.baselines[algo_name], algo_name)
+                evaluation_results[algo_name] = metrics
+            elif algo_name == 'SCA' and self.sca_solver:
+                metrics = self._evaluate_sca()
+                evaluation_results['SCA'] = metrics
+        
+        eval_pbar.close()
         
         # Print comparison
         self._print_evaluation_comparison(evaluation_results)
@@ -554,6 +635,24 @@ class LEOISACTrainer:
             'episode': episode,
             'results': evaluation_results
         })
+
+    def print_status(self, message: str, level: str = "INFO"):
+        """
+        Print status message with timestamp.
+        
+        Args:
+            message: Status message
+            level: Message level (INFO, WARNING, ERROR)
+        """
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        prefix = {
+            "INFO": "ℹ️",
+            "WARNING": "⚠️",
+            "ERROR": "❌",
+            "SUCCESS": "✓"
+        }.get(level, "•")
+        
+        tqdm.write(f"[{timestamp}] {prefix} {message}")
     
     def _evaluate_agent(self, agent: MADDPG_Agent, name: str) -> Dict:
         """
