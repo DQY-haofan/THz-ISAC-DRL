@@ -22,6 +22,10 @@ from geom import (
     Constellation, Satellite, StateVector, OrbitalElements,
     get_visibility_graph
 )
+# 重新导入模块
+import importlib
+import leo_isac_env
+importlib.reload(leo_isac_env)
 
 # Import the new physical layer interface
 from physical_layer_interface import PhysicalLayerInterface
@@ -315,49 +319,45 @@ class LEO_ISAC_Env:
     def _compute_rewards(self, actions: Dict) -> Dict[str, float]:
         """
         Compute ISAC rewards with theoretically consistent sensing reward.
-        
-        This function computes the weighted sum of communication and sensing rewards,
-        minus any penalty for constraint violations.
         """
         rewards = {}
         
         for agent_id in self.agent_ids:
-            # Initialize all reward components first
+            # 初始化所有奖励组件
             r_comm = 0.0
             r_sens = 0.0
-            r_penalty = 0.0  # Initialize penalty to 0 at the beginning
+            r_penalty = 0.0
             
-            # Get communication reward
+            # 获取通信奖励
             try:
-                r_comm = self.phy_interface.get_total_comm_reward(agent_id)
+                r_comm = self.phy_interface.get_total_comm_reward(agent_id) if hasattr(self, 'phy_interface') else 0.0
             except Exception as e:
-                print(f"Warning: Failed to get comm reward for {agent_id}: {e}")
                 r_comm = 0.0
-            
-            # Get sensing reward
+                
+            # 获取感知奖励
             try:
                 r_sens = self._compute_sensing_reward_a_optimal(agent_id)
             except Exception as e:
-                print(f"Warning: Failed to get sensing reward for {agent_id}: {e}")
                 r_sens = 0.0
             
-            # Calculate penalty only if agent has valid actions
-            if agent_id in actions and 'power_allocation' in actions[agent_id]:
-                power_alloc = actions[agent_id].get('power_allocation', {})
-                total_power = sum(power_alloc.values())
-                
-                # Apply penalty for power constraint violation
-                if total_power > self.max_tx_power_w:
-                    excess_ratio = (total_power - self.max_tx_power_w) / self.max_tx_power_w
-                    r_penalty = self.isac_config.w_penalty * excess_ratio
+            # 计算功率惩罚
+            if agent_id in actions:
+                if isinstance(actions[agent_id], dict) and 'power_allocation' in actions[agent_id]:
+                    power_alloc = actions[agent_id].get('power_allocation', {})
+                    total_power = sum(power_alloc.values())
+                    
+                    # 检查功率约束
+                    max_power = self.max_tx_power_w if hasattr(self, 'max_tx_power_w') else 1.0
+                    if total_power > max_power:
+                        excess = total_power - max_power
+                        penalty_weight = self.isac_config.w_penalty if hasattr(self, 'isac_config') else 10.0
+                        r_penalty = penalty_weight * (excess / max_power)
             
-            # Compute final weighted reward
-            total_reward = (
-                self.isac_config.w_comm * r_comm +
-                self.isac_config.w_sens * r_sens -
-                r_penalty
-            )
+            # 计算加权总奖励
+            w_comm = self.isac_config.w_comm if hasattr(self, 'isac_config') else 1.0
+            w_sens = self.isac_config.w_sens if hasattr(self, 'isac_config') else 0.5
             
+            total_reward = w_comm * r_comm + w_sens * r_sens - r_penalty
             rewards[agent_id] = total_reward
         
         return rewards
