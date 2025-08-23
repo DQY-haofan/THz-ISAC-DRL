@@ -484,11 +484,33 @@ class PhysicalLayerInterface:
             # Get power allocation
             tx_power = 0.0
             if tx_id in self.power_allocations:
+                # ... (这段代码保持不变) ...
                 power_alloc = self.power_allocations[tx_id].get('power_allocation', {})
                 tx_power = power_alloc.get(link_id, 0.0)
             
+            # --- START OF CORRECTION ---
+
+            # 获取卫星位置，即使功率为零也需要计算距离
+            tx_idx = self._get_satellite_index(tx_id)
+            rx_idx = self._get_satellite_index(rx_id)
+            tx_pos = self.satellite_states[tx_idx*8:tx_idx*8+3]
+            rx_pos = self.satellite_states[rx_idx*8:rx_idx*8+3]
+            distance = np.linalg.norm(rx_pos - tx_pos)
+
             if tx_power <= 0:
-                continue
+                # 即使功率为零，也要填充默认指标，以确保link_metrics字典的完整性
+                self.link_metrics[link_id] = {
+                    'tx_id': tx_id,
+                    'rx_id': rx_id,
+                    'tx_power': 0.0,
+                    'channel_gain': 0.0,
+                    'distance': distance,
+                    'snr0': 0.0,
+                    'interference': 0.0,  # 会在后续步骤中更新
+                    'sinr_eff': 0.0,
+                    'range_variance': np.inf
+                }
+                continue # 现在可以安全地跳过
                 
             # Get satellite indices and positions
             tx_idx = self._get_satellite_index(tx_id)
