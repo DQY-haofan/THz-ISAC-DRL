@@ -318,29 +318,23 @@ class LEO_ISAC_Env:
         rewards = {}
         
         for agent_id in self.agent_ids:
-            # Communication reward (unchanged)
+            # ... (r_comm, r_sens, r_penalty 的计算保持不变) ...
             r_comm = self.phy_interface.get_total_comm_reward(agent_id)
-            
-            # Sensing reward based on A-optimality (renamed method)
             r_sens = self._compute_sensing_reward_a_optimal(agent_id)
-            
-            # Calculate penalty for constraint violation
-            r_penalty = 0.0
-            if agent_id in actions:
-                power_alloc = actions[agent_id].get('power_allocation', {})
-                total_power = sum(power_alloc.values())
-                if total_power > self.max_tx_power_w:
-                    r_penalty = self.isac_config.w_penalty * (
-                        (total_power - self.max_tx_power_w) / self.max_tx_power_w
-                    )
-            
-            # Combined ISAC reward
+            # ...
+
             rewards[agent_id] = (
                 self.isac_config.w_comm * r_comm +
                 self.isac_config.w_sens * r_sens -
                 r_penalty
             )
-        
+            
+            # --- DEBUG PRINT 2: 检查奖励的构成 ---
+            if os.getenv('VERBOSE_DEBUG') == '1' and self.episode_step < 5: # 只在每回合前几步打印
+                print(f"[DEBUG Env-RWD] Agt {agent_id}: R_comm={r_comm:.3f}, R_sens={r_sens:.3f}, "
+                      f"R_pen={r_penalty:.3f} -> Total={rewards[agent_id]:.3f}")
+            # ---------------------------------------------
+
         return rewards
     
 
