@@ -11,8 +11,9 @@ Integrates all modules: LEO_ISAC_Env, MADDPG_Agent, CentralizedSCASolver, and ba
 Author: THz ISAC Research Team
 Date: August 2025
 """
+import sys
 from tqdm import tqdm
-
+import time
 import argparse
 import yaml
 import os
@@ -27,6 +28,8 @@ import pandas as pd
 from typing import Dict, List, Tuple, Optional, Any
 from collections import defaultdict, deque
 import warnings
+from collections import defaultdict
+from typing import Dict, Tuple
 warnings.filterwarnings('ignore')
 
 # Import custom modules
@@ -355,9 +358,10 @@ class LEOISACTrainer:
         
         return logger
     
+
     def train(self):
         """
-        Main training loop with progress bars.
+        Main training loop with progress bars output to stderr.
         """
         print("=" * 70)
         print("Starting LEO-ISAC MARL Training")
@@ -365,15 +369,17 @@ class LEOISACTrainer:
         print(f"Device: {self.config.device}")
         print(f"Agents: {self.env.n_agents}")
         print("=" * 70)
+        sys.stdout.flush()  # Ensure header is printed immediately
         
-        # Create main progress bar for episodes
+        # Create main progress bar for episodes (output to stderr)
         episode_pbar = tqdm(
             range(self.config.max_episodes),
             desc="Training Episodes",
             unit="ep",
             ncols=100,
             position=0,
-            leave=True
+            leave=True,
+            file=sys.stderr  # Output to stderr for immediate display
         )
         
         # Initialize metrics for progress bar display
@@ -406,37 +412,43 @@ class LEOISACTrainer:
             
             # Update progress bar with key metrics
             episode_pbar.set_postfix({
-                'Reward': f'{episode_reward:.2f}',
-                'Avg(10)': f'{avg_reward:.2f}',
+                'R': f'{episode_reward:.2f}',
+                'Avg': f'{avg_reward:.2f}',
                 'Best': f'{best_reward:.2f}',
-                'Throughput': f"{episode_metrics.get('throughput', 0):.1f}",
-                'Noise': f'{self.current_noise:.3f}'
+                'Tput': f"{episode_metrics.get('throughput', 0):.1f}",
+                'ε': f'{self.current_noise:.3f}'
             })
             
             # Periodic evaluation
             if (episode + 1) % self.config.eval_frequency == 0:
-                print(f"\n{'='*70}")
-                print(f"Evaluation at Episode {episode + 1}")
-                print(f"{'='*70}")
+                # Clear line for clean output
+                print("\n" + "=" * 70, file=sys.stderr)
+                print(f"Evaluation at Episode {episode + 1}", file=sys.stderr)
+                print("=" * 70, file=sys.stderr)
+                sys.stderr.flush()
+                
                 self._evaluate(episode)
-                print(f"{'='*70}\n")
+                
+                print("=" * 70 + "\n", file=sys.stderr)
+                sys.stderr.flush()
             
             # Save models
             if (episode + 1) % self.config.save_frequency == 0:
                 self._save_models(episode)
                 if self.config.verbose:
-                    tqdm.write(f"✓ Models saved at episode {episode + 1}")
+                    tqdm.write(f"✓ Models saved at episode {episode + 1}", file=sys.stderr)
             
             # Print detailed progress every 10 episodes
             if self.config.verbose and episode % 10 == 0 and episode > 0:
                 episode_time = time.time() - episode_start
                 tqdm.write(
-                    f"Episode {episode}/{self.config.max_episodes} | "
+                    f"\n[Episode {episode}] "
                     f"Reward: {episode_reward:.2f} | "
-                    f"Avg: {avg_reward:.2f} | "
+                    f"Avg(10): {avg_reward:.2f} | "
                     f"Throughput: {episode_metrics.get('throughput', 0):.2f} Gbps | "
                     f"GDOP: {episode_metrics.get('gdop', np.inf):.1f} m | "
-                    f"Time: {episode_time:.2f}s"
+                    f"Time: {episode_time:.2f}s\n",
+                    file=sys.stderr
                 )
         
         # Close progress bar
@@ -446,6 +458,8 @@ class LEOISACTrainer:
         print("\n" + "=" * 70)
         print("Training Complete - Running Final Evaluation")
         print("=" * 70)
+        sys.stdout.flush()
+        
         self._evaluate(self.config.max_episodes, final=True)
         
         # Save final models
@@ -456,10 +470,12 @@ class LEOISACTrainer:
         
         print("\n✓ Training completed successfully!")
         print(f"Results saved to: {self.experiment_dir}")
+        sys.stdout.flush()
+
     
     def _run_training_episode(self, episode: int) -> Tuple[float, Dict]:
         """
-        Run a single training episode with step-level progress bar.
+        Run a single training episode with step-level progress bar output to stderr.
         
         Args:
             episode: Episode number
@@ -478,14 +494,16 @@ class LEOISACTrainer:
         # Convert observations to list format for agent
         obs_list = [observations[agent_id] for agent_id in self.env.agent_ids]
         
-        # Create progress bar for steps within episode
+        # Create progress bar for steps within episode (output to stderr)
         step_pbar = tqdm(
             range(self.config.max_steps),
-            desc=f"  Episode {episode} Steps",
-            unit="step",
+            desc=f"  Ep{episode:03d} Steps",
+            unit="st",
             ncols=100,
             position=1,
-            leave=False
+            leave=False,
+            file=sys.stderr,  # Output to stderr
+            disable=not self.config.verbose  # Only show if verbose
         )
         
         for step in step_pbar:
@@ -554,13 +572,13 @@ class LEOISACTrainer:
             episode_metrics['gdop'].append(info.get('gdop', np.inf))
             episode_metrics['active_links'].append(info.get('n_active_links', 0))
             
-            # Update step progress bar
+            # Update step progress bar with compact metrics
             step_pbar.set_postfix({
-                'R': f'{step_reward:.3f}',
-                'Total': f'{episode_reward:.2f}',
-                'Tput': f"{info.get('total_throughput', 0):.1f}",
-                'Links': info.get('n_active_links', 0)
-            })
+                'r': f'{step_reward:.3f}',
+                'R': f'{episode_reward:.2f}',
+                'T': f"{info.get('total_throughput', 0):.1f}",
+                'L': info.get('n_active_links', 0)
+            }, refresh=True)
             
             # Update observations
             obs_list = next_obs_list
@@ -584,18 +602,19 @@ class LEOISACTrainer:
     
     def _evaluate(self, episode: int, final: bool = False):
         """
-        Evaluate current policy against benchmarks with progress indication.
+        Evaluate current policy against benchmarks with progress indication to stderr.
         
         Args:
             episode: Current training episode
             final: Whether this is the final evaluation
         """
-        print(f"\nEvaluation at Episode {episode}:")
-        print("-" * 50)
+        print(f"\nEvaluation at Episode {episode}:", file=sys.stderr)
+        print("-" * 50, file=sys.stderr)
+        sys.stderr.flush()
         
         evaluation_results = {}
         
-        # Create progress bar for evaluation
+        # Create progress bar for evaluation (output to stderr)
         eval_algorithms = ['MADDPG']
         if self.config.compare_baselines:
             eval_algorithms.extend(['random', 'equal', 'greedy'])
@@ -604,13 +623,15 @@ class LEOISACTrainer:
         
         eval_pbar = tqdm(
             eval_algorithms,
-            desc="Evaluating algorithms",
+            desc="Evaluating",
             unit="algo",
-            ncols=100
+            ncols=80,
+            file=sys.stderr,  # Output to stderr
+            leave=False
         )
         
         for algo_name in eval_pbar:
-            eval_pbar.set_description(f"Evaluating {algo_name}")
+            eval_pbar.set_description(f"Eval {algo_name:8s}")
             
             if algo_name == 'MADDPG':
                 metrics = self._evaluate_agent(self.agent, "MADDPG")
@@ -624,7 +645,7 @@ class LEOISACTrainer:
         
         eval_pbar.close()
         
-        # Print comparison
+        # Print comparison (to stdout for logging)
         self._print_evaluation_comparison(evaluation_results)
         
         # Log evaluation results
