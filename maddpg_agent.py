@@ -345,10 +345,14 @@ class MADDPG_Agent:
             info=info
         )
         self.replay_buffer.add(experience)
-    
+
+
     def learn(self, update_actor: bool = True) -> Dict[str, float]:
         """
-        Perform learning update with gradient clipping and GPU support.
+        Perform learning update with gradient clipping, GPU support, and proper batch size handling.
+        
+        This version ensures hidden states are properly reset for the batch size
+        before processing experiences from the replay buffer.
         """
         if not self.replay_buffer.is_ready(self.batch_size):
             return {}
@@ -365,25 +369,39 @@ class MADDPG_Agent:
         # Convert experiences to tensors and move to GPU
         obs_batch = torch.FloatTensor(
             np.array([e.observations for e in experiences])
-        ).to(self.device)  # Move to GPU
+        ).to(self.device)  # Shape: (batch_size, num_agents, obs_dim)
         
         actions_batch = torch.FloatTensor(
             np.array([e.actions for e in experiences])
-        ).to(self.device)  # Move to GPU
+        ).to(self.device)  # Shape: (batch_size, num_agents, action_dim)
         
         rewards_batch = torch.FloatTensor(
             np.array([e.rewards for e in experiences])
-        ).to(self.device)  # Move to GPU
+        ).to(self.device)  # Shape: (batch_size, num_agents)
         
         next_obs_batch = torch.FloatTensor(
             np.array([e.next_observations for e in experiences])
-        ).to(self.device)  # Move to GPU
+        ).to(self.device)  # Shape: (batch_size, num_agents, obs_dim)
         
         dones_batch = torch.FloatTensor(
             np.array([e.dones for e in experiences])
-        ).to(self.device)  # Move to GPU
+        ).to(self.device)  # Shape: (batch_size, num_agents)
         
-        is_weights = torch.FloatTensor(is_weights).to(self.device)  # Move to GPU
+        is_weights = torch.FloatTensor(is_weights).to(self.device)
+        
+        # Get actual batch size (might be different from self.batch_size at the end of buffer)
+        actual_batch_size = obs_batch.size(0)
+        
+        # Reset hidden states for all networks with correct batch size
+        # This is crucial for GRU-based networks
+        for actor in self.actors:
+            actor.reset_hidden(actual_batch_size)
+        for target_actor in self.target_actors:
+            target_actor.reset_hidden(actual_batch_size)
+        for critic in self.critics:
+            critic.reset_hidden(actual_batch_size)
+        for target_critic in self.target_critics:
+            target_critic.reset_hidden(actual_batch_size)
         
         # Separate observations and actions for each agent
         agent_obs = [obs_batch[:, i] for i in range(self.num_agents)]
@@ -402,6 +420,9 @@ class MADDPG_Agent:
             for j in range(self.num_agents):
                 self.target_actors[j].eval()
                 with torch.no_grad():
+                    # Ensure target actor has correct batch size
+                    if hasattr(self.target_actors[j], 'reset_hidden'):
+                        self.target_actors[j].reset_hidden(actual_batch_size)
                     target_action = self.target_actors[j](agent_next_obs[j])
                 target_actions.append(target_action)
             
@@ -411,13 +432,16 @@ class MADDPG_Agent:
             # Calculate target Q-value
             self.target_critics[i].eval()
             with torch.no_grad():
+                # Ensure target critic has correct batch size
+                if hasattr(self.target_critics[i], 'reset_hidden'):
+                    self.target_critics[i].reset_hidden(actual_batch_size)
                 target_q = self.target_critics[i](agent_next_obs, target_actions_flat)
                 target_q = target_q.squeeze()
             
             # Calculate target value with reward
             if self.use_difference_rewards and self.reward_decomposer is not None:
                 # Compute difference reward
-                global_state = obs_batch.view(self.batch_size, -1)
+                global_state = obs_batch.view(actual_batch_size, -1)
                 agent_obs_i = agent_obs[i]
                 agent_action_i = agent_actions[i]
                 
@@ -434,6 +458,10 @@ class MADDPG_Agent:
             y = enhanced_reward + self.gamma * target_q * (1 - agent_dones[i])
             
             # Calculate current Q-value
+            # Ensure critic has correct batch size
+            if hasattr(self.critics[i], 'reset_hidden'):
+                self.critics[i].reset_hidden(actual_batch_size)
+            
             actions_flat = torch.cat(agent_actions, dim=1)
             current_q = self.critics[i](agent_obs, actions_flat).squeeze()
             
@@ -465,16 +493,27 @@ class MADDPG_Agent:
                 for param in self.critics[i].parameters():
                     param.requires_grad = False
                 
+                # Reset actor hidden state for batch
+                if hasattr(self.actors[i], 'reset_hidden'):
+                    self.actors[i].reset_hidden(actual_batch_size)
+                
                 # Get actions from current actor
                 actor_actions = []
                 for j in range(self.num_agents):
                     if j == i:
+                        # Ensure actor has correct batch size
+                        if hasattr(self.actors[j], 'reset_hidden'):
+                            self.actors[j].reset_hidden(actual_batch_size)
                         actor_action = self.actors[j](agent_obs[j])
                     else:
                         actor_action = agent_actions[j].detach()
                     actor_actions.append(actor_action)
                 
                 actions_for_critic = torch.cat(actor_actions, dim=1)
+                
+                # Reset critic hidden state for batch
+                if hasattr(self.critics[i], 'reset_hidden'):
+                    self.critics[i].reset_hidden(actual_batch_size)
                 
                 # Calculate actor loss
                 actor_loss = -self.critics[i](agent_obs, actions_for_critic).mean()
@@ -493,7 +532,7 @@ class MADDPG_Agent:
         
         # Update reward decomposition network if used
         if self.use_difference_rewards and self.reward_decomposer is not None:
-            global_state = obs_batch.view(self.batch_size, -1)
+            global_state = obs_batch.view(actual_batch_size, -1)
             
             reward_loss = 0
             for i in range(self.num_agents):
@@ -516,6 +555,14 @@ class MADDPG_Agent:
         
         # Soft update target networks
         self._soft_update_targets()
+        
+        # Clear hidden state caches to free memory (optional)
+        for critic in self.critics:
+            if hasattr(critic, 'clear_hidden_cache'):
+                critic.clear_hidden_cache()
+        for target_critic in self.target_critics:
+            if hasattr(target_critic, 'clear_hidden_cache'):
+                target_critic.clear_hidden_cache()
         
         # Collect metrics
         metrics.update({

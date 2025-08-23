@@ -680,10 +680,10 @@ class ActorNetwork(nn.Module):
 
 class CriticNetwork(nn.Module):
     """
-    GA-MADDPG Centralized Critic Network with parallel GAT-GRU encoders.
+    GA-MADDPG Centralized Critic Network with dynamic hidden state handling.
     
-    Evaluates Q-values using global information from all agents during training.
-    Can share encoder parameters with actors for improved learning efficiency.
+    This version properly handles batch size mismatches in GRU hidden states,
+    which is crucial for experience replay where batch sizes vary.
     """
     
     def __init__(self, num_agents: int, obs_dim: int, action_dim: int,
@@ -749,15 +749,40 @@ class CriticNetwork(nn.Module):
         
         self.value_mlp = nn.Sequential(*layers)
         
-        # Hidden states for each agent's GRU
-        self.hidden_states = [None] * num_agents
+        # Dictionary to store hidden states with batch size as key
+        self.hidden_states_cache = {}
+        self.current_batch_size = None
         
+    def _get_or_create_hidden_state(self, agent_idx: int, batch_size: int, device: torch.device):
+        """
+        Get or create hidden state for specific agent and batch size.
+        
+        Args:
+            agent_idx: Agent index
+            batch_size: Current batch size
+            device: Device to create tensor on
+            
+        Returns:
+            Hidden state tensor with correct shape
+        """
+        # Create key for caching
+        key = (agent_idx, batch_size)
+        
+        # Check if we have a cached hidden state for this configuration
+        if key not in self.hidden_states_cache:
+            # Create new hidden state
+            self.hidden_states_cache[key] = torch.zeros(
+                1, batch_size, self.gru_hidden, device=device
+            )
+        
+        return self.hidden_states_cache[key]
+    
     def forward(self, observations: List[torch.Tensor],
                 actions: torch.Tensor,
                 neighbor_observations: Optional[List[torch.Tensor]] = None,
                 neighbor_masks: Optional[List[torch.Tensor]] = None) -> torch.Tensor:
         """
-        Compute Q-value for joint observation-action pair.
+        Compute Q-value for joint observation-action pair with dynamic batch handling.
         
         Args:
             observations: List of observations for each agent
@@ -768,7 +793,10 @@ class CriticNetwork(nn.Module):
         Returns:
             Q-value (batch_size, 1)
         """
+        # Determine batch size from first observation
         batch_size = observations[0].size(0)
+        device = observations[0].device
+        
         belief_states = []
         
         # Process each agent's observation through its encoder
@@ -777,12 +805,19 @@ class CriticNetwork(nn.Module):
             neighbor_obs = neighbor_observations[i] if neighbor_observations else None
             neighbor_mask = neighbor_masks[i] if neighbor_masks else None
             
-            belief_state, self.hidden_states[i] = self.encoders[i](
+            # Get or create hidden state with correct batch size
+            hidden_state = self._get_or_create_hidden_state(i, batch_size, device)
+            
+            # Process through encoder
+            belief_state, new_hidden = self.encoders[i](
                 node_obs=obs,
                 neighbor_obs=neighbor_obs,
-                hidden_state=self.hidden_states[i],
+                hidden_state=hidden_state,
                 neighbor_mask=neighbor_mask
             )
+            
+            # Update cached hidden state
+            self.hidden_states_cache[(i, batch_size)] = new_hidden.detach()
             
             belief_states.append(belief_state)
         
@@ -795,11 +830,122 @@ class CriticNetwork(nn.Module):
         return q_value
     
     def reset_hidden(self, batch_size: int = 1):
-        """Reset all agents' GRU hidden states."""
+        """
+        Reset all agents' GRU hidden states for specific batch size.
+        
+        Args:
+            batch_size: Batch size for the hidden states
+        """
+        # Clear cache to force recreation of hidden states
+        self.hidden_states_cache.clear()
+        self.current_batch_size = batch_size
+    
+    def clear_hidden_cache(self):
+        """
+        Clear the entire hidden state cache.
+        Useful for memory management between episodes.
+        """
+        self.hidden_states_cache.clear()
+
+
+class CriticNetworkSimple(nn.Module):
+    """
+    Alternative simplified CriticNetwork without GRU for easier debugging.
+    This version uses only GAT for spatial information without temporal modeling.
+    """
+    
+    def __init__(self, num_agents: int, obs_dim: int, action_dim: int,
+                 num_neighbors: int = 4, neighbor_dim: int = 10,
+                 hidden_dims: List[int] = [512, 256, 128],
+                 gat_hidden: int = 64, gat_heads: int = 4):
+        """
+        Simplified critic without GRU - uses only GAT and MLP.
+        """
+        super(CriticNetworkSimple, self).__init__()
+        
+        self.num_agents = num_agents
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
+        
+        # GAT layers for each agent
+        self.gat_layers = nn.ModuleList([
+            GraphAttentionLayer(
+                in_features=neighbor_dim,
+                out_features=gat_hidden,
+                num_heads=gat_heads
+            ) for _ in range(num_agents)
+        ])
+        
+        # MLP for Q-value estimation
+        # Input: concatenated observations + GAT features + all actions
+        gat_output_dim = gat_heads * gat_hidden
+        input_dim = num_agents * (obs_dim + gat_output_dim + action_dim)
+        
+        layers = []
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(input_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.Dropout(0.1))
+            input_dim = hidden_dim
+        
+        # Output single Q-value
+        layers.append(nn.Linear(input_dim, 1))
+        
+        self.value_mlp = nn.Sequential(*layers)
+    
+    def forward(self, observations: List[torch.Tensor],
+                actions: torch.Tensor,
+                neighbor_observations: Optional[List[torch.Tensor]] = None,
+                neighbor_masks: Optional[List[torch.Tensor]] = None) -> torch.Tensor:
+        """
+        Compute Q-value without GRU (simpler, no hidden state issues).
+        """
+        batch_size = observations[0].size(0)
+        device = observations[0].device
+        
+        processed_obs = []
+        
         for i in range(self.num_agents):
-            self.hidden_states[i] = torch.zeros(1, batch_size, self.gru_hidden)
-            if next(self.parameters()).is_cuda:
-                self.hidden_states[i] = self.hidden_states[i].cuda()
+            obs = observations[i]
+            
+            # Process neighbor information through GAT if available
+            if neighbor_observations and neighbor_observations[i] is not None:
+                neighbor_obs = neighbor_observations[i]
+                neighbor_mask = neighbor_masks[i] if neighbor_masks else None
+                
+                # Use first neighbor as node features for GAT
+                if neighbor_obs.size(1) > 0:
+                    node_feat = neighbor_obs[:, 0, :]
+                    gat_output = self.gat_layers[i](node_feat, neighbor_obs, neighbor_mask)
+                else:
+                    gat_output = torch.zeros(
+                        batch_size, 
+                        self.gat_layers[i].num_heads * self.gat_layers[i].out_features,
+                        device=device
+                    )
+            else:
+                gat_output = torch.zeros(
+                    batch_size,
+                    self.gat_layers[i].num_heads * self.gat_layers[i].out_features,
+                    device=device
+                )
+            
+            # Concatenate observation with GAT output
+            combined = torch.cat([obs, gat_output], dim=-1)
+            processed_obs.append(combined)
+        
+        # Concatenate all processed observations and actions
+        global_state = torch.cat(processed_obs + [actions], dim=-1)
+        
+        # Compute Q-value
+        q_value = self.value_mlp(global_state)
+        
+        return q_value
+    
+    def reset_hidden(self, batch_size: int = 1):
+        """No-op for compatibility (no hidden states in simple version)."""
+        pass
 
 
 class RewardDecompositionNetwork(nn.Module):
