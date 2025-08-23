@@ -77,6 +77,9 @@ class PhysicalLayerInterface:
         self.bandwidth_hz = hardware_config.bandwidth_ghz * 1e9
         self.max_tx_power_w = 10**((hardware_config.tx_power_max_dbm - 30) / 10)
         
+        
+        self.link_registry: Dict[str, Tuple[str, str]] = {}
+
         # Initialize hardware profile
         self.hw_profile = get_hardware_params(hardware_config.hardware_level)
         
@@ -137,10 +140,11 @@ class PhysicalLayerInterface:
         self.last_update_time = 0.0
 
     def update_dynamic_state(self,
-                            current_time: float,
-                            satellite_states: np.ndarray,
-                            active_links: Set[Tuple[str, str]],
-                            power_allocations: Dict[str, Dict[str, float]]):
+                        current_time: float,
+                        satellite_states: np.ndarray,
+                        active_links: Set[Tuple[str, str]],
+                        power_allocations: Dict[str, Dict[str, float]],
+                        link_registry: Dict[str, Tuple[str, str]]): # <-- 添加这一行
         """
         Update the interface with current dynamic network state.
         
@@ -149,7 +153,7 @@ class PhysicalLayerInterface:
         # Invalidate cache when state changes
         self._cache_valid = False
         self._cache.clear()
-        
+        self.link_registry = link_registry
         # Store current state
         self.current_time = current_time
         self.satellite_states = satellite_states
@@ -475,7 +479,7 @@ class PhysicalLayerInterface:
             link_mapping[link_id] = (tx_id, rx_id)
         
         # Compute metrics for each link
-        for link_id, (tx_id, rx_id) in link_mapping.items():
+        for link_id, (tx_id, rx_id) in self.link_registry.items():
             # Get power allocation
             tx_power = 0.0
             if tx_id in self.power_allocations:

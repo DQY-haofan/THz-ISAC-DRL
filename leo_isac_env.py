@@ -307,7 +307,8 @@ class LEO_ISAC_Env:
             current_time=self.current_time,
             satellite_states=state_matrix.flatten(),
             active_links=self.active_links,
-            power_allocations=power_allocations
+            power_allocations=power_allocations,
+            link_registry=self.link_registry # <-- 添加这一行
         )
     
     def _compute_rewards(self, actions: Dict) -> Dict[str, float]:
