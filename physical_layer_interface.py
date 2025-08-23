@@ -453,9 +453,10 @@ class PhysicalLayerInterface:
         This is the main computational engine that calculates all physical
         metrics when the dynamic state is updated.
         """
+        self.link_metrics = {}
+        self.interference_matrix = {}
         # Clear previous results
-        self.link_metrics.clear()
-        self.interference_matrix.clear()
+
         
         # Phase 1: Compute individual link metrics
         self._compute_link_metrics()
