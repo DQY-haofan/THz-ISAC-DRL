@@ -436,7 +436,10 @@ class DifferentiableProjectionLayer(nn.Module):
 # Modify existing ActorNetwork to support both modes
 class ActorNetwork(nn.Module):
     """
-    GA-MADDPG Actor Network with optional GRU support.
+    GA-MADDPG Actor Network with optional GRU support and dual projection modes.
+    
+    This version includes both differentiable projection (for training) and
+    non-differentiable projection (for inference/target networks).
     """
     
     def __init__(self, obs_dim: int, action_dim: int,
@@ -446,15 +449,26 @@ class ActorNetwork(nn.Module):
                  gru_hidden: int = 128,
                  total_power_budget: float = 1.0,
                  per_link_max: float = 0.5,
-                 use_gru: bool = True,  # NEW PARAMETER
+                 use_gru: bool = True,
                  use_cyclical_encoding: bool = False,
                  cyclical_periods: Optional[Dict[int, float]] = None):
         """
-        Initialize actor network with optional GRU.
+        Initialize actor network with optional GRU and dual projection modes.
         
         Args:
-            use_gru: Whether to use GRU for temporal modeling (default True)
-            ... (other args unchanged)
+            obs_dim: Dimension of each agent's observation
+            action_dim: Dimension of each agent's action (continuous)
+            num_neighbors: Maximum number of neighbors per agent
+            neighbor_dim: Dimension of neighbor features
+            hidden_dims: Hidden layer dimensions for MLP
+            gat_hidden: GAT hidden dimension
+            gat_heads: Number of GAT attention heads
+            gru_hidden: GRU hidden dimension
+            total_power_budget: Total power constraint for projection layer
+            per_link_max: Per-link power constraint
+            use_gru: Whether to use GRU for temporal modeling
+            use_cyclical_encoding: Whether to use cyclical encoding
+            cyclical_periods: Periods for cyclical features
         """
         super(ActorNetwork, self).__init__()
         
@@ -462,6 +476,8 @@ class ActorNetwork(nn.Module):
         self.action_dim = action_dim
         self.use_gru = use_gru
         self.gru_hidden = gru_hidden if use_gru else 0
+        self.total_power_budget = total_power_budget
+        self.per_link_max = per_link_max
         
         # Cyclical encoder (if used)
         if use_cyclical_encoding and cyclical_periods:
@@ -505,18 +521,106 @@ class ActorNetwork(nn.Module):
         layers.append(nn.Linear(input_dim, action_dim))
         self.mlp = nn.Sequential(*layers)
         
-        # Projection layer
+        # Differentiable projection layer (for training)
         self.projection = DifferentiableProjectionLayer(
             num_links=action_dim,
             total_power_budget=total_power_budget,
             per_link_max=per_link_max
         )
+        
+        # Setup cvxpy problem for non-differentiable projection (for inference)
+        self._setup_numpy_projection()
+    
+    def _setup_numpy_projection(self):
+        """
+        Setup cvxpy problem for non-differentiable projection.
+        This is used when gradients are not needed (e.g., in target networks).
+        """
+        self._p_var = cp.Variable(self.action_dim)
+        self._p_raw_param = cp.Parameter(self.action_dim)
+        
+        # Define objective: minimize ||p - p_raw||^2
+        _obj = cp.Minimize(cp.sum_squares(self._p_var - self._p_raw_param))
+        
+        # Define constraints
+        _constraints = [
+            self._p_var >= 0,  # Non-negativity
+            self._p_var <= self.per_link_max,  # Per-link maximum
+            cp.sum(self._p_var) <= self.total_power_budget  # Total budget
+        ]
+        
+        # Create problem
+        self._proj_problem = cp.Problem(_obj, _constraints)
+    
+    def _project_numpy(self, raw_power: torch.Tensor) -> torch.Tensor:
+        """
+        Non-differentiable projection using raw cvxpy for inference.
+        
+        This method is used when gradients are not needed, providing
+        a stable and efficient projection without the complexity of CvxpyLayer.
+        
+        Args:
+            raw_power: Unconstrained power allocation (batch_size, num_links)
+            
+        Returns:
+            Projected power allocation satisfying all constraints
+        """
+        batch_size = raw_power.size(0)
+        device = raw_power.device
+        raw_power_np = raw_power.detach().cpu().numpy()
+        
+        projected = []
+        
+        for i in range(batch_size):
+            # Load data into cvxpy parameter
+            self._p_raw_param.value = raw_power_np[i]
+            
+            # Solve optimization problem
+            try:
+                self._proj_problem.solve(solver=cp.ECOS, verbose=False)
+                
+                if self._proj_problem.status in ["optimal", "optimal_inaccurate"]:
+                    proj_sample = self._p_var.value
+                else:
+                    # If solve fails, use a simple clipping fallback
+                    proj_sample = np.clip(raw_power_np[i], 0, self.per_link_max)
+                    total = proj_sample.sum()
+                    if total > self.total_power_budget:
+                        proj_sample *= self.total_power_budget / total
+                        
+            except Exception as e:
+                # Fallback to simple clipping if cvxpy fails
+                warnings.warn(f"CVXPY solve failed: {e}, using fallback projection")
+                proj_sample = np.clip(raw_power_np[i], 0, self.per_link_max)
+                total = proj_sample.sum()
+                if total > self.total_power_budget:
+                    proj_sample *= self.total_power_budget / total
+            
+            projected.append(proj_sample)
+        
+        # Convert back to tensor
+        projected_np = np.stack(projected)
+        projected_tensor = torch.FloatTensor(projected_np).to(device)
+        
+        return projected_tensor
     
     def forward(self, obs: torch.Tensor,
                 neighbor_obs: Optional[torch.Tensor] = None,
                 neighbor_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Forward pass with optional GRU."""
+        """
+        Forward pass with dual projection modes.
         
+        Uses differentiable projection during training (when gradients are enabled)
+        and non-differentiable projection during inference (e.g., in target networks).
+        
+        Args:
+            obs: Agent's observation (batch_size, obs_dim)
+            neighbor_obs: Neighbors' observations (batch_size, num_neighbors, neighbor_dim)
+            neighbor_mask: Valid neighbor mask (batch_size, num_neighbors)
+            
+        Returns:
+            Actions satisfying constraints (batch_size, action_dim)
+        """
         # Apply cyclical encoding if configured
         if self.cyclical_encoder is not None:
             obs = self.cyclical_encoder(obs)
@@ -531,7 +635,7 @@ class ActorNetwork(nn.Module):
             )
             features = belief_state
         else:
-            # Use GAT only
+            # Use GAT only (no GRU)
             if neighbor_obs is not None and neighbor_obs.size(1) > 0:
                 node_feat = neighbor_obs[:, 0, :]
                 neighbor_context = self.gat(node_feat, neighbor_obs, neighbor_mask)
@@ -543,18 +647,36 @@ class ActorNetwork(nn.Module):
                 )
             features = torch.cat([obs, neighbor_context], dim=-1)
         
-        # Generate actions
+        # Generate raw actions through MLP
         raw_actions = self.mlp(features)
-        safe_actions = self.projection(raw_actions)
+        
+        # Apply projection based on gradient mode
+        if torch.is_grad_enabled():
+            # Training mode: use differentiable CvxpyLayer
+            try:
+                safe_actions = self.projection(raw_actions)
+            except Exception as e:
+                # If CvxpyLayer fails, fallback to numpy projection
+                warnings.warn(f"CvxpyLayer failed: {e}, using numpy projection")
+                safe_actions = self._project_numpy(raw_actions)
+        else:
+            # Inference mode (e.g., in target networks): use stable numpy projection
+            safe_actions = self._project_numpy(raw_actions)
         
         return safe_actions
     
     def reset_hidden(self, batch_size: int = 1):
-        """Reset GRU hidden state (only if using GRU)."""
+        """
+        Reset GRU hidden state (only if using GRU).
+        
+        Args:
+            batch_size: Batch size for the hidden state
+        """
         if self.use_gru:
             device = next(self.parameters()).device
             self.hidden_state = torch.zeros(1, batch_size, self.gru_hidden, device=device)
 
+            
 
 class CriticNetwork(nn.Module):
     """
