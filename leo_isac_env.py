@@ -317,6 +317,7 @@ class LEO_ISAC_Env:
         Compute ISAC rewards with theoretically consistent sensing reward.
         """
         rewards = {}
+        r_penalty = 0.0
         
         for agent_id in self.agent_ids:
             # 获取通信和感知效用
