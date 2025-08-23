@@ -317,50 +317,68 @@ class LEO_ISAC_Env:
     
     # ==================== START: COPY THIS ENTIRE FUNCTION ====================
     def _compute_rewards(self, actions: Dict) -> Dict[str, float]:
-        """
-        Compute ISAC rewards with theoretically consistent sensing reward.
-        """
-        rewards = {}
-        
-        for agent_id in self.agent_ids:
-            # 初始化所有奖励组件
-            r_comm = 0.0
-            r_sens = 0.0
-            r_penalty = 0.0
+            """
+            Compute ISAC rewards with theoretically consistent sensing reward.
             
-            # 获取通信奖励
-            try:
-                r_comm = self.phy_interface.get_total_comm_reward(agent_id) if hasattr(self, 'phy_interface') else 0.0
-            except Exception as e:
+            This function computes rewards for each agent based on:
+            - Communication performance (throughput)
+            - Sensing performance (Fisher Information)
+            - Penalty for constraint violations
+            """
+            rewards = {}
+            
+            for agent_id in self.agent_ids:
+                # Step 1: Initialize all reward components to zero
                 r_comm = 0.0
-                
-            # 获取感知奖励
-            try:
-                r_sens = self._compute_sensing_reward_a_optimal(agent_id)
-            except Exception as e:
                 r_sens = 0.0
+                r_penalty = 0.0
+                
+                # Step 2: Get communication reward
+                try:
+                    r_comm = self.phy_interface.get_total_comm_reward(agent_id)
+                except Exception as e:
+                    # If physical layer interface fails, use zero reward
+                    r_comm = 0.0
+                    if hasattr(self, 'verbose') and self.verbose:
+                        print(f"Warning: Failed to get comm reward for {agent_id}: {e}")
+                
+                # Step 3: Get sensing reward
+                try:
+                    r_sens = self._compute_sensing_reward_a_optimal(agent_id)
+                except Exception as e:
+                    # If sensing computation fails, use zero reward
+                    r_sens = 0.0
+                    if hasattr(self, 'verbose') and self.verbose:
+                        print(f"Warning: Failed to get sensing reward for {agent_id}: {e}")
+                
+                # Step 4: Calculate penalty for power constraint violations
+                if agent_id in actions:
+                    # Check if actions[agent_id] is a dictionary and has power_allocation
+                    if isinstance(actions[agent_id], dict) and 'power_allocation' in actions[agent_id]:
+                        power_alloc = actions[agent_id].get('power_allocation', {})
+                        
+                        # Calculate total power used
+                        total_power = 0.0
+                        for link_id, power in power_alloc.items():
+                            if isinstance(power, (int, float)):
+                                total_power += float(power)
+                        
+                        # Apply penalty if power budget is exceeded
+                        if total_power > self.max_tx_power_w:
+                            excess = total_power - self.max_tx_power_w
+                            r_penalty = self.isac_config.w_penalty * (excess / self.max_tx_power_w)
+                
+                # Step 5: Compute weighted sum of rewards
+                total_reward = (
+                    self.isac_config.w_comm * r_comm +
+                    self.isac_config.w_sens * r_sens -
+                    r_penalty
+                )
+                
+                # Store the reward for this agent
+                rewards[agent_id] = total_reward
             
-            # 计算功率惩罚
-            if agent_id in actions:
-                if isinstance(actions[agent_id], dict) and 'power_allocation' in actions[agent_id]:
-                    power_alloc = actions[agent_id].get('power_allocation', {})
-                    total_power = sum(power_alloc.values())
-                    
-                    # 检查功率约束
-                    max_power = self.max_tx_power_w if hasattr(self, 'max_tx_power_w') else 1.0
-                    if total_power > max_power:
-                        excess = total_power - max_power
-                        penalty_weight = self.isac_config.w_penalty if hasattr(self, 'isac_config') else 10.0
-                        r_penalty = penalty_weight * (excess / max_power)
-            
-            # 计算加权总奖励
-            w_comm = self.isac_config.w_comm if hasattr(self, 'isac_config') else 1.0
-            w_sens = self.isac_config.w_sens if hasattr(self, 'isac_config') else 0.5
-            
-            total_reward = w_comm * r_comm + w_sens * r_sens - r_penalty
-            rewards[agent_id] = total_reward
-        
-        return rewards
+            return rewards
 # ===================== END: COPY THIS ENTIRE FUNCTION =====================
 
     def _compute_sensing_reward_a_optimal(self, agent_id: str) -> float:
@@ -371,9 +389,6 @@ class LEO_ISAC_Env:
         which corresponds to minimizing the sum of estimation error variances.
         This is implemented as a proxy using the trace of FIM contributions.
         
-        Note: The reward is based on trace(J_link), which relates to A-optimality
-        (minimizing trace of CRLB), not D-optimality (minimizing determinant of CRLB).
-        
         Args:
             agent_id: Agent identifier
             
@@ -381,29 +396,47 @@ class LEO_ISAC_Env:
             Sensing reward based on FIM trace contribution
         """
         try:
+            # Check if physical layer interface is available
+            if not hasattr(self, 'phy_interface') or self.phy_interface is None:
+                return 0.0
+            
             # Get current network FIM from physical layer
-            if self.phy_interface.efim is not None:
+            if hasattr(self.phy_interface, 'efim') and self.phy_interface.efim is not None:
                 current_fim = self.phy_interface.efim
                 
                 # Calculate contribution from agent's links
                 agent_contribution = 0.0
-                for link_id, metrics in self.phy_interface.link_metrics.items():
-                    if metrics['tx_id'] == agent_id:
-                        # Get FIM contribution from this link
-                        J_link = self.phy_interface.get_fim_contribution(link_id)
-                        if J_link is not None:
-                            # A-optimality: minimize trace(CRLB) = minimize trace(J^-1)
-                            # As proxy, we maximize trace(J) which relates to information gain
-                            agent_contribution += np.trace(J_link) / self.n_agents
+                
+                # Check if link_metrics exists
+                if hasattr(self.phy_interface, 'link_metrics'):
+                    for link_id, metrics in self.phy_interface.link_metrics.items():
+                        if metrics.get('tx_id') == agent_id:
+                            # Get FIM contribution from this link
+                            try:
+                                J_link = self.phy_interface.get_fim_contribution(link_id)
+                                if J_link is not None and J_link.size > 0:
+                                    # A-optimality: minimize trace(CRLB) = minimize trace(J^-1)
+                                    # As proxy, we maximize trace(J) which relates to information gain
+                                    trace_value = np.trace(J_link)
+                                    if np.isfinite(trace_value):
+                                        agent_contribution += trace_value / self.n_agents
+                            except Exception as e:
+                                # Skip this link if FIM computation fails
+                                continue
                 
                 # Normalize by network size and apply logarithmic scaling
-                reward = np.log(1 + agent_contribution)
+                if agent_contribution > 0:
+                    reward = np.log(1 + agent_contribution)
+                else:
+                    reward = 0.0
             else:
                 # No valid FIM, return zero reward
                 reward = 0.0
                 
         except Exception as e:
-            warnings.warn(f"Error computing A-optimal reward: {e}")
+            # Return zero reward on any error
+            if hasattr(self, 'verbose') and self.verbose:
+                warnings.warn(f"Error computing A-optimal reward for {agent_id}: {e}")
             reward = 0.0
         
         return reward
