@@ -9,7 +9,7 @@ environment:
   bandwidth_ghz: 10        # 10 GHz bandwidth
   tx_power_dbm: 30         # 1W transmit power
   noise_figure_db: 3.0     # Typical receiver NF
-  max_isl_range_km: 5000   # Maximum ISL range
+  max_isl_range_km: 10000   # Maximum ISL range
 
 # ISAC Task Configuration (Balanced weights)
 isac:
