@@ -619,56 +619,6 @@ class PhysicalLayerInterface:
     
         return self.interference_matrix
     
-    def _compute_interference_and_update_sinr(self):
-        """
-        Compute interference and update SINR and range variance for all links.
-        """
-        # 临时存储每个链路的归一化干扰总和
-        normalized_interference_map = defaultdict(float)
-
-        # 遍历每一对链路来计算干扰
-        for victim_id, victim_metrics in self.link_metrics.items():
-            if victim_metrics.get('snr0', 0) <= 0:
-                continue
-
-            total_normalized_interference = 0
-            for interferer_id, interferer_metrics in self.link_metrics.items():
-                if victim_id == interferer_id:
-                    continue
-                
-                # ... (此处应插入你已实现的、精确的alpha_lm计算逻辑) ...
-                # 作为一个临时的、功能正确的占位符，我们使用简化模型：
-                alpha_lm = 1e-3 # 假设一个固定的、小的干扰系数
-                
-                # 计算归一化干扰 alpha_tilde = SNR0 * alpha
-                alpha_tilde = victim_metrics['snr0'] * alpha_lm
-                total_normalized_interference += alpha_tilde
-            
-            normalized_interference_map[victim_id] = total_normalized_interference
-
-        # 现在，用计算出的干扰来更新每个链路的最终指标
-        for link_id, metrics in self.link_metrics.items():
-            if metrics.get('snr0', 0) <= 0:
-                metrics['sinr_eff'] = 0.0
-                metrics['range_variance'] = np.inf
-                continue
-
-            sinr_eff = calculate_effective_sinr(
-                metrics['snr0'],
-                self.hw_profile.gamma_eff,
-                self.hw_profile.sigma_phi_squared,
-                normalized_interference_map[link_id]
-            )
-            
-            range_var = calculate_range_variance_m2(
-                sinr_eff,
-                self.hw_profile.sigma_phi_squared,
-                self.frequency_hz,
-                bandwidth=self.bandwidth_hz
-            )
-
-            metrics['sinr_eff'] = sinr_eff
-            metrics['range_variance'] = range_var
 
     def get_all_direct_channel_gains(self) -> Dict[str, complex]:
         """
