@@ -44,13 +44,15 @@ network:
 
 # Training Configuration (Short run)
 training:
-  max_episodes: 50        # Quick test run
-  max_steps_per_episode: 20  # Shorter episodes
+  max_episodes: 100        # Quick test run
+  max_steps_per_episode: 50  # Shorter episodes
   warmup_episodes: 5      # Brief exploration phase
   update_frequency: 1      # Update every step
   noise_decay_rate: 0.99   # Faster noise decay
   min_noise: 0.01          # Minimum exploration noise
   gradient_clip_norm: 0.5  # Gradient clipping for stability
+  num_parallel_envs: 4  # 并行环境数量
+
 
 # Evaluation Configuration
 evaluation:

@@ -578,102 +578,102 @@ class LEOISACTrainer:
             print("Matplotlib not available, skipping plots")
 
         def _run_training_episode(self, episode: int) -> Tuple[float, Dict]:
-        """
-        Run a single training episode with vectorized environments.
-        Modified to handle batched data from parallel environments.
-        """
-        # Reset all environments
-        observations = self.env.reset()  # Shape: (num_envs, num_agents, obs_dim)
-        self.agent.reset_noise()
-        self.agent.reset_hidden_states(batch_size=self.num_parallel_envs)
-        
-        episode_rewards = np.zeros(self.num_parallel_envs)
-        episode_metrics = defaultdict(lambda: [])
-        episode_dones = np.zeros(self.num_parallel_envs, dtype=bool)
-        
-        for step in range(self.config.max_steps):
-            # Reshape observations for agent processing
-            # From (num_envs, num_agents, obs_dim) to list of arrays
-            obs_list = []
-            for env_idx in range(self.num_parallel_envs):
-                if not episode_dones[env_idx]:
-                    obs_list.append(observations[env_idx])
+            """
+            Run a single training episode with vectorized environments.
+            Modified to handle batched data from parallel environments.
+            """
+            # Reset all environments
+            observations = self.env.reset()  # Shape: (num_envs, num_agents, obs_dim)
+            self.agent.reset_noise()
+            self.agent.reset_hidden_states(batch_size=self.num_parallel_envs)
             
-            if len(obs_list) == 0:
-                break  # All episodes done
+            episode_rewards = np.zeros(self.num_parallel_envs)
+            episode_metrics = defaultdict(lambda: [])
+            episode_dones = np.zeros(self.num_parallel_envs, dtype=bool)
             
-            # Select actions for all active environments
-            if episode < self.config.warmup_episodes:
-                # Random actions during warmup
-                actions = np.random.rand(self.num_parallel_envs, self.n_agents, 4) * 0.3
-            else:
-                # Get actions from agent for each environment
-                actions = []
+            for step in range(self.config.max_steps):
+                # Reshape observations for agent processing
+                # From (num_envs, num_agents, obs_dim) to list of arrays
+                obs_list = []
                 for env_idx in range(self.num_parallel_envs):
                     if not episode_dones[env_idx]:
-                        env_obs = [observations[env_idx, i] for i in range(self.n_agents)]
-                        env_actions = self.agent.select_actions(
-                            env_obs,
-                            add_noise=True,
-                            noise_scale=self.current_noise
-                        )
-                        actions.append(env_actions)
-                    else:
-                        actions.append(np.zeros((self.n_agents, 4)))
-                actions = np.array(actions)
+                        obs_list.append(observations[env_idx])
+                
+                if len(obs_list) == 0:
+                    break  # All episodes done
+                
+                # Select actions for all active environments
+                if episode < self.config.warmup_episodes:
+                    # Random actions during warmup
+                    actions = np.random.rand(self.num_parallel_envs, self.n_agents, 4) * 0.3
+                else:
+                    # Get actions from agent for each environment
+                    actions = []
+                    for env_idx in range(self.num_parallel_envs):
+                        if not episode_dones[env_idx]:
+                            env_obs = [observations[env_idx, i] for i in range(self.n_agents)]
+                            env_actions = self.agent.select_actions(
+                                env_obs,
+                                add_noise=True,
+                                noise_scale=self.current_noise
+                            )
+                            actions.append(env_actions)
+                        else:
+                            actions.append(np.zeros((self.n_agents, 4)))
+                    actions = np.array(actions)
+                
+                # Environment step
+                next_observations, rewards, dones, infos = self.env.step(actions)
+                
+                # Process results for each environment
+                for env_idx in range(self.num_parallel_envs):
+                    if not episode_dones[env_idx]:
+                        # Accumulate rewards
+                        env_reward = np.mean(rewards[env_idx])
+                        episode_rewards[env_idx] += env_reward
+                        
+                        # Store experience
+                        if episode >= self.config.warmup_episodes:
+                            self.agent.store_experience(
+                                observations[env_idx],
+                                actions[env_idx],
+                                rewards[env_idx],
+                                next_observations[env_idx],
+                                np.array([dones[env_idx]] * self.n_agents),
+                                infos[env_idx]
+                            )
+                        
+                        # Collect metrics
+                        episode_metrics['throughput'].append(infos[env_idx].get('total_throughput', 0))
+                        episode_metrics['gdop'].append(infos[env_idx].get('gdop', np.inf))
+                        
+                        # Check if episode done
+                        if dones[env_idx]:
+                            episode_dones[env_idx] = True
+                
+                # Learn from experience (more frequently due to more data)
+                if episode >= self.config.warmup_episodes and \
+                step % max(1, self.config.update_frequency // self.num_parallel_envs) == 0:
+                    learn_metrics = self.agent.learn()
+                    for key, value in learn_metrics.items():
+                        episode_metrics[f'learn_{key}'].append(value)
+                
+                # Update observations
+                observations = next_observations
+                
+                # Check if all episodes are done
+                if np.all(episode_dones):
+                    break
             
-            # Environment step
-            next_observations, rewards, dones, infos = self.env.step(actions)
+            # Aggregate metrics across parallel environments
+            total_episode_reward = np.mean(episode_rewards)
             
-            # Process results for each environment
-            for env_idx in range(self.num_parallel_envs):
-                if not episode_dones[env_idx]:
-                    # Accumulate rewards
-                    env_reward = np.mean(rewards[env_idx])
-                    episode_rewards[env_idx] += env_reward
-                    
-                    # Store experience
-                    if episode >= self.config.warmup_episodes:
-                        self.agent.store_experience(
-                            observations[env_idx],
-                            actions[env_idx],
-                            rewards[env_idx],
-                            next_observations[env_idx],
-                            np.array([dones[env_idx]] * self.n_agents),
-                            infos[env_idx]
-                        )
-                    
-                    # Collect metrics
-                    episode_metrics['throughput'].append(infos[env_idx].get('total_throughput', 0))
-                    episode_metrics['gdop'].append(infos[env_idx].get('gdop', np.inf))
-                    
-                    # Check if episode done
-                    if dones[env_idx]:
-                        episode_dones[env_idx] = True
+            aggregated_metrics = {}
+            for key, values in episode_metrics.items():
+                if values:
+                    aggregated_metrics[key] = np.mean(values)
             
-            # Learn from experience (more frequently due to more data)
-            if episode >= self.config.warmup_episodes and \
-               step % max(1, self.config.update_frequency // self.num_parallel_envs) == 0:
-                learn_metrics = self.agent.learn()
-                for key, value in learn_metrics.items():
-                    episode_metrics[f'learn_{key}'].append(value)
-            
-            # Update observations
-            observations = next_observations
-            
-            # Check if all episodes are done
-            if np.all(episode_dones):
-                break
-        
-        # Aggregate metrics across parallel environments
-        total_episode_reward = np.mean(episode_rewards)
-        
-        aggregated_metrics = {}
-        for key, values in episode_metrics.items():
-            if values:
-                aggregated_metrics[key] = np.mean(values)
-        
-        return total_episode_reward, aggregated_metrics
+            return total_episode_reward, aggregated_metrics
     
     def _evaluate(self, episode: int, final: bool = False):
         """
