@@ -332,7 +332,8 @@ class LEO_ISAC_Env:
                 r_comm = 0.0
                 r_sens = 0.0
                 r_penalty = 0.0
-                
+                base_reward = 0.1  # 给一个小的基础奖励
+
                 # Step 2: Get communication reward
                 try:
                     r_comm = self.phy_interface.get_total_comm_reward(agent_id)

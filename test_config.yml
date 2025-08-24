@@ -14,10 +14,12 @@ environment:
 # ISAC Task Configuration (Balanced weights)
 isac:
   w_comm: 1.0              # Communication weight
-  w_sens: 0.5              # Sensing weight (reduced for initial test)
-  w_penalty: 5.0           # Moderate penalty for violations
+  w_sens: 0.1              # Sensing weight (reduced for initial test)
+  w_penalty: 1.0           # Moderate penalty for violations
   sensing_mode: "cooperative_orbit_determination"
-  min_links_for_sensing: 1  # Only 1 link in 2-sat network
+  min_links_for_sensing: 2  # Only 1 link in 2-sat network
+  episode_length: 20  # 缩短episode！关键改动
+
 
 # Agent Configuration (Aggressive learning for quick convergence)
 agent:
@@ -26,9 +28,9 @@ agent:
   reward_lr: 0.0005        # Reward decomposition LR
   tau: 0.01                # Faster soft update
   gamma: 0.95              # Slightly lower discount for faster learning
-  buffer_capacity: 50000   # Smaller buffer for quick testing
+  buffer_capacity: 10000   # Smaller buffer for quick testing
   batch_size: 64           # Smaller batch for more frequent updates
-  use_prioritized_replay: true
+  use_prioritized_replay: false  
   use_difference_rewards: false  # Disable for simplicity
   use_gru: false           # IMPORTANT: Use MLP baseline for stability
 
@@ -42,9 +44,9 @@ network:
 
 # Training Configuration (Short run)
 training:
-  max_episodes: 200        # Quick test run
-  max_steps_per_episode: 50  # Shorter episodes
-  warmup_episodes: 20      # Brief exploration phase
+  max_episodes: 50        # Quick test run
+  max_steps_per_episode: 20  # Shorter episodes
+  warmup_episodes: 5      # Brief exploration phase
   update_frequency: 1      # Update every step
   noise_decay_rate: 0.99   # Faster noise decay
   min_noise: 0.01          # Minimum exploration noise
@@ -52,14 +54,14 @@ training:
 
 # Evaluation Configuration
 evaluation:
-  frequency: 20            # Evaluate every 20 episodes
-  episodes: 5              # Quick evaluation
+  frequency: 10            # Evaluate every 20 episodes
+  episodes: 3              # Quick evaluation
   benchmark_sca: false     # Skip SCA for speed
   compare_baselines: true  # Compare with simple baselines
 
 # Logging Configuration
 logging:
   use_tensorboard: true
-  save_frequency: 50       # Save models every 50 episodes
+  save_frequency: 20       # Save models every 50 episodes
   verbose: true            # Print progress
   log_dir: "./test_run"    # Test run directory
