@@ -193,7 +193,7 @@ class LEOISACTrainer:
     Main trainer class that orchestrates the training and evaluation pipeline.
     """
     
-        def __init__(self, config: ExperimentConfig, args: argparse.Namespace):
+    def __init__(self, config: ExperimentConfig, args: argparse.Namespace):
         """
         Initialize trainer with config and command line arguments.
         Modified to use vectorized environments.
