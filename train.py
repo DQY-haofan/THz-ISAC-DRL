@@ -27,6 +27,8 @@ import yaml
 import os
 import json
 import csv
+from vectorized_env import SubprocVecEnv
+
 import time
 from datetime import datetime
 from pathlib import Path
@@ -191,13 +193,10 @@ class LEOISACTrainer:
     Main trainer class that orchestrates the training and evaluation pipeline.
     """
     
-    def __init__(self, config: ExperimentConfig, args: argparse.Namespace):
+        def __init__(self, config: ExperimentConfig, args: argparse.Namespace):
         """
         Initialize trainer with config and command line arguments.
-        
-        Args:
-            config: Experiment configuration from YAML
-            args: Command line arguments (override config)
+        Modified to use vectorized environments.
         """
         self.config = config
         self.args = args
@@ -236,9 +235,50 @@ class LEOISACTrainer:
             'gdop_m', 'sinr_db', 'convergence_time'
         ])
         
-        # Initialize environment
-        self.env = self._create_environment()
+        # ========== MODIFIED: Use vectorized environments ==========
+        # Determine number of parallel environments
+        self.num_parallel_envs = getattr(args, 'num_envs', 4)  # Default to 4 parallel envs
+        
+        # Create configurations for parallel environments
+        env_configs = []
+        for i in range(self.num_parallel_envs):
+            env_config = {
+                'constellation': {
+                    'n_satellites': self.config.n_satellites,
+                    'altitude_km': self.config.altitude_km,
+                    'inclination_deg': getattr(self.config, 'inclination_deg', 53.0),
+                    'propagation_model': getattr(self.config, 'propagation_model', 'keplerian'),
+                    'max_isl_range_km': getattr(self.config, 'max_isl_range_km', 5000.0)
+                },
+                'hardware': {
+                    'frequency_ghz': self.config.frequency_ghz,
+                    'bandwidth_ghz': self.config.bandwidth_ghz,
+                    'antenna_diameter_m': getattr(self.config, 'antenna_diameter_m', 0.5),
+                    'tx_power_max_dbm': self.config.tx_power_dbm,
+                    'noise_figure_db': getattr(self.config, 'noise_figure_db', 3.0),
+                    'hardware_level': getattr(self.config, 'hardware_level', 'High-Performance')
+                },
+                'isac': {
+                    'w_comm': self.config.w_comm,
+                    'w_sens': self.config.w_sens,
+                    'w_penalty': self.config.w_penalty,
+                    'sensing_mode': getattr(self.config, 'sensing_mode', 'cooperative_orbit_determination'),
+                    'min_links_for_sensing': getattr(self.config, 'min_links_for_sensing', 3),
+                    'time_step_s': getattr(self.config, 'time_step_s', 1.0),
+                    'episode_length': self.config.max_steps
+                }
+            }
+            env_configs.append(env_config)
+        
+        # Initialize vectorized training environment
+        print(f"Creating {self.num_parallel_envs} parallel training environments...")
+        self.env = SubprocVecEnv(env_configs)
+        self.n_agents = self.env.num_agents
+        self.agent_ids = self.env.agent_ids
+        
+        # Create single evaluation environment (keep original for evaluation)
         self.eval_env = self._create_environment()
+        # ========== END MODIFIED ==========
         
         # Initialize agent with device and GRU flag
         self.agent = self._create_agent()
@@ -271,7 +311,8 @@ class LEOISACTrainer:
         
         # Exploration noise schedule
         self.current_noise = 1.0
-        
+    
+    
     def _create_experiment_dir(self) -> Path:
         """Create directory for experiment outputs."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -536,110 +577,103 @@ class LEOISACTrainer:
         except ImportError:
             print("Matplotlib not available, skipping plots")
 
-    def _run_training_episode(self, episode: int) -> Tuple[float, Dict]:
+        def _run_training_episode(self, episode: int) -> Tuple[float, Dict]:
         """
-        Run a single training episode (simplified progress for Colab).
+        Run a single training episode with vectorized environments.
+        Modified to handle batched data from parallel environments.
         """
-        # Reset environment and agent
-        observations = self.env.reset()
+        # Reset all environments
+        observations = self.env.reset()  # Shape: (num_envs, num_agents, obs_dim)
         self.agent.reset_noise()
-        self.agent.reset_hidden_states()
+        self.agent.reset_hidden_states(batch_size=self.num_parallel_envs)
         
-        episode_reward = 0
-        episode_metrics = defaultdict(list)
+        episode_rewards = np.zeros(self.num_parallel_envs)
+        episode_metrics = defaultdict(lambda: [])
+        episode_dones = np.zeros(self.num_parallel_envs, dtype=bool)
         
-        # Convert observations to list format
-        obs_list = [observations[agent_id] for agent_id in self.env.agent_ids]
-        
-        # In Colab, use simpler progress indication
-        if IN_COLAB and self.config.verbose and episode % 10 == 0:
-            # Only show progress bar for every 10th episode to reduce clutter
-            steps = range(self.config.max_steps)
-            show_progress = True
-        else:
-            steps = range(self.config.max_steps)
-            show_progress = False
-        
-        if show_progress:
-            step_pbar = tqdm(steps, desc=f"  Episode {episode}", leave=False)
-        else:
-            step_pbar = steps
-        
-        for step in step_pbar:
-            # Select actions
-            if episode < self.config.warmup_episodes:
-                actions = np.random.rand(self.env.n_agents, 4) * 0.3
-            else:
-                actions = self.agent.select_actions(
-                    obs_list,
-                    add_noise=True,
-                    noise_scale=self.current_noise
-                )
+        for step in range(self.config.max_steps):
+            # Reshape observations for agent processing
+            # From (num_envs, num_agents, obs_dim) to list of arrays
+            obs_list = []
+            for env_idx in range(self.num_parallel_envs):
+                if not episode_dones[env_idx]:
+                    obs_list.append(observations[env_idx])
             
-            # Convert actions to environment format
-            action_dict = {}
-            for i, agent_id in enumerate(self.env.agent_ids):
-                agent_links = [
-                    lid for lid, (tx, rx) in self.env.link_registry.items()
-                    if tx == agent_id
-                ]
-                
-                power_alloc = {}
-                for j, link_id in enumerate(agent_links[:4]):
-                    if j < len(actions[i]):
-                        power_alloc[link_id] = float(actions[i][j])
-                
-                action_dict[agent_id] = {
-                    'power_allocation': power_alloc,
-                    'beam_selection': {}
-                }
+            if len(obs_list) == 0:
+                break  # All episodes done
+            
+            # Select actions for all active environments
+            if episode < self.config.warmup_episodes:
+                # Random actions during warmup
+                actions = np.random.rand(self.num_parallel_envs, self.n_agents, 4) * 0.3
+            else:
+                # Get actions from agent for each environment
+                actions = []
+                for env_idx in range(self.num_parallel_envs):
+                    if not episode_dones[env_idx]:
+                        env_obs = [observations[env_idx, i] for i in range(self.n_agents)]
+                        env_actions = self.agent.select_actions(
+                            env_obs,
+                            add_noise=True,
+                            noise_scale=self.current_noise
+                        )
+                        actions.append(env_actions)
+                    else:
+                        actions.append(np.zeros((self.n_agents, 4)))
+                actions = np.array(actions)
             
             # Environment step
-            next_observations, rewards, done, info = self.env.step(action_dict)
+            next_observations, rewards, dones, infos = self.env.step(actions)
             
-            # Convert to arrays
-            next_obs_list = [next_observations[agent_id] for agent_id in self.env.agent_ids]
-            rewards_array = np.array([rewards[agent_id] for agent_id in self.env.agent_ids])
-            dones_array = np.array([done] * self.env.n_agents)
+            # Process results for each environment
+            for env_idx in range(self.num_parallel_envs):
+                if not episode_dones[env_idx]:
+                    # Accumulate rewards
+                    env_reward = np.mean(rewards[env_idx])
+                    episode_rewards[env_idx] += env_reward
+                    
+                    # Store experience
+                    if episode >= self.config.warmup_episodes:
+                        self.agent.store_experience(
+                            observations[env_idx],
+                            actions[env_idx],
+                            rewards[env_idx],
+                            next_observations[env_idx],
+                            np.array([dones[env_idx]] * self.n_agents),
+                            infos[env_idx]
+                        )
+                    
+                    # Collect metrics
+                    episode_metrics['throughput'].append(infos[env_idx].get('total_throughput', 0))
+                    episode_metrics['gdop'].append(infos[env_idx].get('gdop', np.inf))
+                    
+                    # Check if episode done
+                    if dones[env_idx]:
+                        episode_dones[env_idx] = True
             
-            # Store experience
-            if episode >= self.config.warmup_episodes:
-                self.agent.store_experience(
-                    np.array(obs_list),
-                    actions,
-                    rewards_array,
-                    np.array(next_obs_list),
-                    dones_array,
-                    info
-                )
-            
-            # Learn from experience
+            # Learn from experience (more frequently due to more data)
             if episode >= self.config.warmup_episodes and \
-            step % self.config.update_frequency == 0:
+               step % max(1, self.config.update_frequency // self.num_parallel_envs) == 0:
                 learn_metrics = self.agent.learn()
                 for key, value in learn_metrics.items():
                     episode_metrics[f'learn_{key}'].append(value)
             
-            # Accumulate metrics
-            step_reward = np.mean(rewards_array)
-            episode_reward += step_reward
-            episode_metrics['throughput'].append(info.get('total_throughput', 0))
-            episode_metrics['gdop'].append(info.get('gdop', np.inf))
-            episode_metrics['active_links'].append(info.get('n_active_links', 0))
-            
             # Update observations
-            obs_list = next_obs_list
+            observations = next_observations
             
-            if done:
+            # Check if all episodes are done
+            if np.all(episode_dones):
                 break
         
-        # Aggregate episode metrics
+        # Aggregate metrics across parallel environments
+        total_episode_reward = np.mean(episode_rewards)
+        
         aggregated_metrics = {}
         for key, values in episode_metrics.items():
             if values:
                 aggregated_metrics[key] = np.mean(values)
         
-        return episode_reward, aggregated_metrics
+        return total_episode_reward, aggregated_metrics
     
     def _evaluate(self, episode: int, final: bool = False):
         """
@@ -1154,6 +1188,10 @@ def parse_arguments():
     parser.add_argument('--save_freq', type=int, default=100,
                        help='Model save frequency (episodes)')
     
+    # 添加向量化环境参数
+    parser.add_argument('--num_envs', type=int, default=4,
+                       help='Number of parallel environments for training')
+    
     return parser.parse_args()
 
 
@@ -1198,9 +1236,11 @@ class CSVLogger:
             self.file.flush()
     
     def close(self):
-        """Close the CSV file."""
-        if self.file:
-            self.file.close()
+        """Clean up environment resources."""
+        if hasattr(self, 'env'):
+            self.env.close()
+        if hasattr(self, 'eval_env'):
+            self.eval_env.close()
 
 
 def main():
