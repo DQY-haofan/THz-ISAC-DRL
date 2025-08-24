@@ -316,70 +316,142 @@ class LEO_ISAC_Env:
         )
     
     # ==================== START: COPY THIS ENTIRE FUNCTION ====================
-    def _compute_rewards(self, actions: Dict) -> Dict[str, float]:
-            """
-            Compute ISAC rewards with theoretically consistent sensing reward.
-            
-            This function computes rewards for each agent based on:
-            - Communication performance (throughput)
-            - Sensing performance (Fisher Information)
-            - Penalty for constraint violations
-            """
-            rewards = {}
-            
-            for agent_id in self.agent_ids:
-                # Step 1: Initialize all reward components to zero
-                r_comm = 0.0
-                r_sens = 0.0
-                r_penalty = 0.0
-                base_reward = 0.1  # 给一个小的基础奖励
 
-                # Step 2: Get communication reward
-                try:
-                    r_comm = self.phy_interface.get_total_comm_reward(agent_id)
-                except Exception as e:
-                    # If physical layer interface fails, use zero reward
-                    r_comm = 0.0
-                    if hasattr(self, 'verbose') and self.verbose:
-                        print(f"Warning: Failed to get comm reward for {agent_id}: {e}")
-                
-                # Step 3: Get sensing reward
-                try:
-                    r_sens = self._compute_sensing_reward_a_optimal(agent_id)
-                except Exception as e:
-                    # If sensing computation fails, use zero reward
-                    r_sens = 0.0
-                    if hasattr(self, 'verbose') and self.verbose:
-                        print(f"Warning: Failed to get sensing reward for {agent_id}: {e}")
-                
-                # Step 4: Calculate penalty for power constraint violations
-                if agent_id in actions:
-                    # Check if actions[agent_id] is a dictionary and has power_allocation
-                    if isinstance(actions[agent_id], dict) and 'power_allocation' in actions[agent_id]:
-                        power_alloc = actions[agent_id].get('power_allocation', {})
-                        
-                        # Calculate total power used
-                        total_power = 0.0
-                        for link_id, power in power_alloc.items():
-                            if isinstance(power, (int, float)):
-                                total_power += float(power)
-                        
-                        # Apply penalty if power budget is exceeded
-                        if total_power > self.max_tx_power_w:
-                            excess = total_power - self.max_tx_power_w
-                            r_penalty = self.isac_config.w_penalty * (excess / self.max_tx_power_w)
-                
-                # Step 5: Compute weighted sum of rewards
-                total_reward = (
-                    self.isac_config.w_comm * r_comm +
-                    self.isac_config.w_sens * r_sens -
-                    r_penalty
-                )
-                
-                # Store the reward for this agent
-                rewards[agent_id] = total_reward
+    def _compute_rewards(self, actions: Dict) -> Dict[str, float]:
+        """
+        Compute ISAC rewards with improved learning signals and debugging.
+        
+        This enhanced version provides:
+        - Better shaped rewards for easier learning
+        - Debug information to diagnose issues
+        - Graceful fallbacks for edge cases
+        """
+        rewards = {}
+        
+        # Debug: Track reward components
+        debug_info = {
+            'total_sinr': 0.0,
+            'active_links': 0,
+            'total_power_used': 0.0,
+            'violations': 0
+        }
+        
+        for agent_id in self.agent_ids:
+            # Initialize reward components
+            r_existence = 0.1  # Small existence reward to avoid sparse rewards
+            r_comm = 0.0
+            r_sens = 0.0
+            r_penalty = 0.0
+            r_efficiency = 0.0  # New: reward for power efficiency
             
-            return rewards
+            # ========== Communication Reward ==========
+            # Count active links and sum communication performance
+            agent_active_links = 0
+            agent_total_sinr = 0.0
+            
+            for link_id, metrics in self.phy_interface.link_metrics.items():
+                if metrics.get('tx_id') == agent_id:
+                    sinr_eff = metrics.get('sinr_eff', 0.0)
+                    if sinr_eff > 0:
+                        agent_active_links += 1
+                        agent_total_sinr += sinr_eff
+                        
+                        # Shaped reward: log(1 + SINR) for diminishing returns
+                        link_reward = np.log(1 + sinr_eff)
+                        r_comm += link_reward
+                        
+                        # Debug tracking
+                        debug_info['active_links'] += 1
+                        debug_info['total_sinr'] += sinr_eff
+            
+            # Bonus for maintaining multiple active links
+            if agent_active_links > 0:
+                r_comm += 0.1 * agent_active_links  # Small bonus per active link
+            
+            # ========== Sensing Reward (Simplified) ==========
+            # Use a simplified sensing reward that's easier to optimize
+            if agent_active_links > 0:
+                # Simple proxy: more active links = better sensing coverage
+                r_sens = 0.05 * np.sqrt(agent_active_links)
+                
+                # Optional: Try to get actual FIM contribution (but with fallback)
+                try:
+                    fim_reward = self._compute_sensing_reward_a_optimal(agent_id)
+                    if fim_reward > 0 and np.isfinite(fim_reward):
+                        r_sens = min(fim_reward, 1.0)  # Cap to avoid explosion
+                except:
+                    pass  # Use simple proxy if FIM fails
+            
+            # ========== Power Management ==========
+            total_power = 0.0
+            power_allocation = {}
+            
+            if agent_id in actions:
+                if isinstance(actions[agent_id], dict) and 'power_allocation' in actions[agent_id]:
+                    power_allocation = actions[agent_id]['power_allocation']
+                    
+                    for link_id, power in power_allocation.items():
+                        if isinstance(power, (int, float)):
+                            total_power += float(power)
+                    
+                    debug_info['total_power_used'] += total_power
+            
+            # Power efficiency reward (encourage using power wisely)
+            if total_power > 0 and agent_total_sinr > 0:
+                # Efficiency = SINR per unit power
+                efficiency = agent_total_sinr / total_power
+                r_efficiency = 0.1 * np.tanh(efficiency)  # Bounded efficiency reward
+            
+            # Power constraint penalty
+            if total_power > self.max_tx_power_w:
+                excess_ratio = (total_power - self.max_tx_power_w) / self.max_tx_power_w
+                r_penalty = self.isac_config.w_penalty * excess_ratio
+                debug_info['violations'] += 1
+            
+            # ========== Exploration Bonus ==========
+            # Small reward for trying different power levels (entropy bonus)
+            if len(power_allocation) > 0:
+                power_values = [p for p in power_allocation.values() if p > 0]
+                if len(power_values) > 1:
+                    # Reward diversity in power allocation
+                    power_std = np.std(power_values)
+                    r_exploration = 0.01 * np.tanh(power_std)
+                else:
+                    r_exploration = 0.0
+            else:
+                r_exploration = 0.0
+            
+            # ========== Combine Rewards ==========
+            # Use a more balanced weighting scheme
+            total_reward = (
+                r_existence +  # Always positive baseline
+                self.isac_config.w_comm * r_comm +
+                self.isac_config.w_sens * r_sens +
+                r_efficiency +  # Encourage efficiency
+                r_exploration -  # Encourage exploration
+                r_penalty  # Penalize violations
+            )
+            
+            # Clip reward to reasonable range to avoid instability
+            total_reward = np.clip(total_reward, -10.0, 10.0)
+            
+            rewards[agent_id] = total_reward
+        
+        # ========== Debug Output (every N steps) ==========
+        if hasattr(self, 'episode_step') and self.episode_step % 10 == 0:
+            if debug_info['active_links'] == 0:
+                print(f"⚠️ Step {self.episode_step}: No active links! Check power allocation.")
+            elif self.episode_step % 50 == 0:  # Less frequent detailed debug
+                print(f"Debug Step {self.episode_step}:")
+                print(f"  Active links: {debug_info['active_links']}")
+                print(f"  Avg SINR: {debug_info['total_sinr']/max(1, debug_info['active_links']):.2f}")
+                print(f"  Power used: {debug_info['total_power_used']:.2f}W")
+                print(f"  Violations: {debug_info['violations']}")
+                print(f"  Avg reward: {np.mean(list(rewards.values())):.3f}")
+        
+        return rewards
+
+
 # ===================== END: COPY THIS ENTIRE FUNCTION =====================
 
     def _compute_sensing_reward_a_optimal(self, agent_id: str) -> float:
